@@ -116,22 +116,28 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size
 
 // --- 4. 核心启动逻辑 ---
 void hack_start(const char *game_data_dir) {
-    LOGI("[🚀] 启动【全网通】深度扫描...");
+    LOGI("[🚀] 忍者扫描器已就位...");
     for (int i = 0; i < 30; i++) {
         void *handle = xdl_open("libil2cpp.so", 0);
         if (handle) {
-            // 1. 获取 il2cpp 官方解析器的地址
-            void* resolve_addr = dlsym(handle, "il2cpp_resolve_icall");
-            if (resolve_addr) {
-                LOGI("[✅] 核心分发器已锁定: %p", resolve_addr);
+            uintptr_t base = get_module_base("libil2cpp.so");
+            if (base) {
+                LOGI("[✅] 锁定游戏基址: %p", (void*)base);
+
+                // 部署 Hook
+                manual_inline_hook(base + 0x937C58, (void*)universal_spy);
                 
-                // 我们直接 Hook 这个分发器，看看游戏到底在偷偷调什么函数
-                manual_inline_hook((uintptr_t)resolve_addr, (void*)universal_spy);
+                // --- 核心：启动内存监视器 ---
+                std::thread([base]() {
+                    while (true) {
+                        unsigned char* pc = (unsigned char*)(base + 0x937C58);
+                        // 打印当前内存前4字节，看我们的跳转指令 (50 00 00 58) 还在不在
+                        LOGI("[🔍] 内存实时状态: %02X %02X %02X %02X", pc[0], pc[1], pc[2], pc[3]);
+                        sleep(2);
+                    }
+                }).detach();
             }
-
-            // 2. 同时在内存中搜索 "Send" 字符串相关的逻辑
-            // ... (保持原本的 Dump 逻辑，让我们看看 dump.cs 是否有变动) ...
-
+            
             il2cpp_api_init(handle);
             il2cpp_dump(game_data_dir);
             break;
