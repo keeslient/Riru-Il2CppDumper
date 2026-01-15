@@ -132,22 +132,27 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size
 
 // --- 4. 核心启动逻辑 ---
 void hack_start(const char *game_data_dir) {
-    LOGI("[🚀] 忍者扫描器正在启动...");
+    LOGI("[🚀] 发现新版 dump.cs，重新锁定目标...");
     for (int i = 0; i < 30; i++) {
         void *handle = xdl_open("libil2cpp.so", 0);
         if (handle) {
             uintptr_t base = get_module_base("libil2cpp.so");
             if (base) {
-                LOGI("[✅] 锁定游戏基址: %p", (void*)base);
+                LOGI("[✅] 基址: %p, 部署新版拦截点...", (void*)base);
 
-                // 部署监控 (RVA: 0x937C58)
-                manual_inline_hook(base + 0x937C58, (void*)universal_spy);
+                // --- 目标 1: 加密点 (发包明文最容易抓的地方) ---
+                uintptr_t encrypt_rva = 0x94FE00; 
+                manual_inline_hook(base + encrypt_rva, (void*)universal_spy);
                 
-                // 启动“心跳”监测线程
-                std::thread([base]() {
+                // --- 目标 2: 发包点 (确认行为) ---
+                uintptr_t send_rva = 0x948D40;
+                // 注意：如果 manual_inline_hook 没做指令备份，这里 Hook 两个点容易崩，我们先监视 Encrypt
+                
+                // 启动新版“心跳”监测
+                std::thread([base, encrypt_rva]() {
                     while (true) {
-                        unsigned char* pc = (unsigned char*)(base + 0x937C58);
-                        LOGI("[🔍] 内存实时状态: %02X %02X %02X %02X", pc[0], pc[1], pc[2], pc[3]);
+                        unsigned char* pc = (unsigned char*)(base + encrypt_rva);
+                        LOGI("[🔍] 监控 Encrypt (0x94FE00) 状态: %02X %02X %02X %02X", pc[0], pc[1], pc[2], pc[3]);
                         ::sleep(2);
                     }
                 }).detach();
