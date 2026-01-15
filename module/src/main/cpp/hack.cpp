@@ -15,6 +15,7 @@
 #include <android/log.h>
 #include <cstdlib>
 #include <string>
+#include <sys/socket.h>
 
 #define LOG_TAG "IMO_NINJA"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -35,15 +36,31 @@ uintptr_t get_module_base(const char* name) {
     return start;
 }
 
-// --- 1. 监控回调 ---
-void universal_spy(void* instance, void* arg1) {
-    LOGI("[🔥] 捕获到动作！实例: %p, 参数: %p", instance, arg1);
+// --- 1. 底层 Socket 拦截 (针对 libc) ---
+// 如果 il2cpp 层的 RVA 没反应，这个绝对有反应
+ssize_t (*old_sendto)(int, const void *, size_t, int, const struct sockaddr *, socklen_t);
+
+ssize_t new_sendto(int s, const void *buf, size_t len, int flags, const struct sockaddr *to, socklen_t tolen) {
+    if (len > 5) { // 过滤微小的心跳包
+        LOGI("[📡] 底层 Socket 拦截成功! 长度: %zu", len);
+        unsigned char* p = (unsigned char*)buf;
+        char hex_buf[64] = {0};
+        for(int i=0; i<16 && i<len; i++) sprintf(hex_buf + strlen(hex_buf), "%02X ", p[i]);
+        LOGI("[📦] 发送数据头: %s", hex_buf);
+    }
+    return old_sendto(s, buf, len, flags, to, tolen);
 }
 
-// --- 2. 手动 Hook 核心 ---
-void manual_inline_hook(uintptr_t target_addr, void* new_func) {
+// --- 2. 业务层监控回调 ---
+void universal_spy(void* instance, void* arg1) {
+    LOGI("[🔥] 业务层命中！实例: %p, 参数(可能是Packet): %p", instance, arg1);
+}
+
+// --- 3. 手动 Hook 核心 (ARM64) ---
+void manual_inline_hook(uintptr_t target_addr, void* new_func, void** old_func_ptr = nullptr) {
     uintptr_t page_start = target_addr & ~0xFFF;
     if (mprotect((void*)page_start, 4096, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+        if (old_func_ptr) *old_func_ptr = (void*)target_addr; 
         uint32_t jmp_ins[] = {
             0x58000050, // LDR X16, #8
             0xd61f0200, // BR X16
@@ -55,7 +72,7 @@ void manual_inline_hook(uintptr_t target_addr, void* new_func) {
     }
 }
 
-// --- 3. 补全 Dumper 必须函数 ---
+// --- 4. 补全 Dumper 辅助函数 ---
 std::string GetLibDir(JavaVM *vms) {
     JNIEnv *env = nullptr;
     vms->AttachCurrentThread(&env, nullptr);
@@ -130,44 +147,40 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size
     return false;
 }
 
-// --- 4. 核心启动逻辑 ---
+// --- 5. 核心启动逻辑 ---
 void hack_start(const char *game_data_dir) {
-    LOGI("[🚀] 忍者全家桶布控中，这次务必抓到...");
+    LOGI("[🚀] 忍者全家桶 + 底层 Socket 最终布控...");
+
+    // 方案 A: 拦截系统底层 Socket
+    void* libc_handle = dlopen("libc.so", RTLD_NOW);
+    if (libc_handle) {
+        void* sendto_addr = dlsym(libc_handle, "sendto");
+        if (sendto_addr) {
+            manual_inline_hook((uintptr_t)sendto_addr, (void*)new_sendto, (void**)&old_sendto);
+            LOGI("[✅] 系统级监控 (libc.sendto) 部署成功");
+        }
+    }
+
+    // 方案 B: 拦截业务层 (依据最新 dump.cs)
     for (int i = 0; i < 30; i++) {
         void *handle = xdl_open("libil2cpp.so", 0);
         if (handle) {
             uintptr_t base = get_module_base("libil2cpp.so");
             if (base) {
-                LOGI("[✅] 基址锁定: %p，开始撒网...", (void*)base);
+                LOGI("[✅] 基址锁定: %p，业务布控开始...", (void*)base);
 
-                // 根据最新 dump.cs 提取的 5 大金刚
+                // 根据最新 dump.cs 地址
+                manual_inline_hook(base + 0x948D40, (void*)universal_spy); // SendPacket
+                manual_inline_hook(base + 0x948FB0, (void*)universal_spy); // ProcessSend
+                manual_inline_hook(base + 0x94FE00, (void*)universal_spy); // PacketEncrypt
+                manual_inline_hook(base + 0x9497A0, (void*)universal_spy); // OnSend
                 
-                // 1. 业务发包点 (NetworkManager$$SendPacket)
-                manual_inline_hook(base + 0x948D40, (void*)universal_spy);
-                LOGI("[📌] 1. SendPacket 挂载成功");
-
-                // 2. 底层处理点 (NetworkManager$$ProcessSend)
-                manual_inline_hook(base + 0x948FB0, (void*)universal_spy);
-                LOGI("[📌] 2. ProcessSend 挂载成功");
-
-                // 3. 关键加密点 (Packet$$Encrypt) - 这个点最稳
-                manual_inline_hook(base + 0x94FE00, (void*)universal_spy);
-                LOGI("[📌] 3. PacketEncrypt 挂载成功");
-
-                // 4. Socket 写入点 (NetworkManager$$OnSend)
-                manual_inline_hook(base + 0x9497A0, (void*)universal_spy);
-                LOGI("[📌] 4. OnSend 挂载成功");
-
-                // 5. 备用加密点 (AESEncrypt256)
-                manual_inline_hook(base + 0x24190, (void*)universal_spy);
-                LOGI("[📌] 5. AESEncrypt 挂载成功");
-
-                // 实时心跳监控（依然监控 Encrypt 确认注入存活）
+                // 实时心跳监控
                 std::thread([base]() {
                     while (true) {
                         unsigned char* pc = (unsigned char*)(base + 0x94FE00);
                         LOGI("[🔍] 心跳(Encrypt): %02X %02X %02X %02X", pc[0], pc[1], pc[2], pc[3]);
-                        ::sleep(5); // 改成5秒一次，别让心跳刷屏
+                        ::sleep(10); 
                     }
                 }).detach();
             }
