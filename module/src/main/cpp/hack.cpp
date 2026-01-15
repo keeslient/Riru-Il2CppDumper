@@ -193,6 +193,30 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size
 }
 
 void hack_prepare(const char *game_data_dir, void *data, size_t length) {
+    LOGI("======================================");
+    LOGI(">>> Dumper 线程已启动，Ninja 开始寄生 <<<");
+    LOGI("======================================");
+
+    // 1. 获取 libil2cpp.so 的基址 (这个项目里应该已经有获取基址的逻辑，可以直接用)
+    // 假设它获取基址的变量叫 il2cpp_base，如果没有，用我们之前的：
+    uintptr_t il2cpp_base = 0;
+    while (il2cpp_base == 0) {
+        // 这里可以直接调用项目里现成的 get_module_base 逻辑
+        // 如果没有，就用最原始的方法读取 /proc/self/maps
+        il2cpp_base = get_module_base("libil2cpp.so"); 
+        usleep(500000);
+    }
+
+    LOGI("[🚀] 发现 libil2cpp 基址: %p", (void*)il2cpp_base);
+
+    // 2. 既然你不用 Dobby，我们直接读取内存特征来验证地址对不对
+    // 监控 SendPacket (0x937C58)
+    uintptr_t target_rva = 0x937C58;
+    unsigned char* pc = (unsigned char*)(il2cpp_base + target_rva);
+
+    // 打印内存前 8 字节机器码，验证是否为函数开头
+    LOGI("[💎] SendPacket 内存数据: %02X %02X %02X %02X %02X %02X %02X %02X", 
+         pc[0], pc[1], pc[2], pc[3], pc[4], pc[5], pc[6], pc[7]);
     LOGI("hack thread: %d", gettid());
     int api_level = android_get_device_api_level();
     LOGI("api level: %d", api_level);
