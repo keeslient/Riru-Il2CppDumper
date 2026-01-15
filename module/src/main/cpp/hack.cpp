@@ -116,40 +116,22 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size
 
 // --- 4. 核心启动逻辑 ---
 void hack_start(const char *game_data_dir) {
-    LOGI("[🚀] Ninja 核心准备中...");
-    bool load = false;
+    LOGI("[🚀] 启动【全网通】深度扫描...");
     for (int i = 0; i < 30; i++) {
         void *handle = xdl_open("libil2cpp.so", 0);
         if (handle) {
-            load = true;
-            uintptr_t base = 0;
-            FILE* fp = fopen("/proc/self/maps", "r");
-            if (fp) {
-                char line[1024];
-                while (fgets(line, sizeof(line), fp)) {
-                    if (strstr(line, "libil2cpp.so")) {
-                        base = (uintptr_t)strtoull(line, nullptr, 16);
-                        break;
-                    }
-                }
-                fclose(fp);
+            // 1. 获取 il2cpp 官方解析器的地址
+            void* resolve_addr = dlsym(handle, "il2cpp_resolve_icall");
+            if (resolve_addr) {
+                LOGI("[✅] 核心分发器已锁定: %p", resolve_addr);
+                
+                // 我们直接 Hook 这个分发器，看看游戏到底在偷偷调什么函数
+                manual_inline_hook((uintptr_t)resolve_addr, (void*)universal_spy);
             }
 
-            if (base != 0) {
-                LOGI("[✅] 基址锁定: %p, 开始三路布控...", (void*)base);
-                // 点位1: SendPacket (0x937C58)
-                manual_inline_hook(base + 0x937C58, (void*)universal_spy);
-                LOGI("[📌] 监控点 A 就绪");
+            // 2. 同时在内存中搜索 "Send" 字符串相关的逻辑
+            // ... (保持原本的 Dump 逻辑，让我们看看 dump.cs 是否有变动) ...
 
-                // 点位2: ProcessSend (0x937ED4)
-                manual_inline_hook(base + 0x937ED4, (void*)universal_spy);
-                LOGI("[📌] 监控点 B 就绪");
-
-                // 点位3: Encrypt (0x93EBDC)
-                manual_inline_hook(base + 0x93EBDC, (void*)universal_spy);
-                LOGI("[📌] 监控点 C 就绪");
-            }
-            
             il2cpp_api_init(handle);
             il2cpp_dump(game_data_dir);
             break;
