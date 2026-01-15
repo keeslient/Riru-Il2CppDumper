@@ -16,7 +16,13 @@
 #include <sys/mman.h>
 #include <linux/unistd.h>
 #include <array>
+#include <android/log.h>
+#include <unistd.h>
+#include <cstdio>
+#include <cstdlib>
 
+#define LOG_TAG "IMO_NINJA"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 void hack_start(const char *game_data_dir) {
     bool load = false;
     for (int i = 0; i < 10; i++) {
