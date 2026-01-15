@@ -15,12 +15,11 @@
 #include <android/log.h>
 #include <cstdlib>
 #include <string>
-#include <sys/socket.h>
 
 #define LOG_TAG "IMO_NINJA"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
-// --- 补全缺失的工具函数 ---
+// --- 工具函数：获取模块基址 ---
 uintptr_t get_module_base(const char* name) {
     FILE* fp = fopen("/proc/self/maps", "r");
     if (!fp) return 0;
@@ -36,43 +35,33 @@ uintptr_t get_module_base(const char* name) {
     return start;
 }
 
-// --- 1. 底层 Socket 拦截 (针对 libc) ---
-// 如果 il2cpp 层的 RVA 没反应，这个绝对有反应
-ssize_t (*old_sendto)(int, const void *, size_t, int, const struct sockaddr *, socklen_t);
+// --- 核心：内存镜像 Dump 函数 ---
+// 只要能读到内存，就能把它导出来分析，绕过所有 Hook 检测
+void dump_memory_mirror(const char* so_name, const char* out_name) {
+    uintptr_t base = get_module_base(so_name);
+    if (!base) return;
 
-ssize_t new_sendto(int s, const void *buf, size_t len, int flags, const struct sockaddr *to, socklen_t tolen) {
-    if (len > 5) { // 过滤微小的心跳包
-        LOGI("[📡] 底层 Socket 拦截成功! 长度: %zu", len);
-        unsigned char* p = (unsigned char*)buf;
-        char hex_buf[64] = {0};
-        for(int i=0; i<16 && i<len; i++) sprintf(hex_buf + strlen(hex_buf), "%02X ", p[i]);
-        LOGI("[📦] 发送数据头: %s", hex_buf);
-    }
-    return old_sendto(s, buf, len, flags, to, tolen);
-}
+    LOGI("[📡] 发现目标库 %s，基址: %p，准备抄家...", so_name, (void*)base);
 
-// --- 2. 业务层监控回调 ---
-void universal_spy(void* instance, void* arg1) {
-    LOGI("[🔥] 业务层命中！实例: %p, 参数(可能是Packet): %p", instance, arg1);
-}
+    // 假设乱码库大小 4MB，我们 Dump 8MB 确保万无一失
+    size_t dump_size = 8 * 1024 * 1024; 
+    char path[256];
+    // 存放在游戏私有目录，避免权限问题
+    sprintf(path, "/sdcard/Android/data/com.com2us.imo.normal.freefull.google.global.android.common/files/%s", out_name);
 
-// --- 3. 手动 Hook 核心 (ARM64) ---
-void manual_inline_hook(uintptr_t target_addr, void* new_func, void** old_func_ptr = nullptr) {
-    uintptr_t page_start = target_addr & ~0xFFF;
-    if (mprotect((void*)page_start, 4096, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
-        if (old_func_ptr) *old_func_ptr = (void*)target_addr; 
-        uint32_t jmp_ins[] = {
-            0x58000050, // LDR X16, #8
-            0xd61f0200, // BR X16
-            (uint32_t)((uintptr_t)new_func & 0xFFFFFFFF),
-            (uint32_t)((uintptr_t)new_func >> 32)
-        };
-        memcpy((void*)target_addr, jmp_ins, sizeof(jmp_ins));
-        __builtin___clear_cache((char*)target_addr, (char*)target_addr + sizeof(jmp_ins));
+    FILE* fp = fopen(path, "wb");
+    if (fp) {
+        // 使用最稳妥的 fwrite 读内存
+        fwrite((void*)base, 1, dump_size, fp);
+        fclose(fp);
+        LOGI("[✅] 抄家成功！镜像已保存至: %s", path);
+        LOGI("[💡] 请将此文件拉到电脑，搜索你的 Wireshark 特征码或分析 SVC 指令");
+    } else {
+        LOGI("[❌] 导出失败，请检查 SD 卡权限或目录是否存在");
     }
 }
 
-// --- 4. 补全 Dumper 辅助函数 ---
+// --- 补全 Dumper 必要函数 ---
 std::string GetLibDir(JavaVM *vms) {
     JNIEnv *env = nullptr;
     vms->AttachCurrentThread(&env, nullptr);
@@ -88,11 +77,11 @@ std::string GetLibDir(JavaVM *vms) {
                     jobject application_info = env->CallObjectMethod(application, get_application_info);
                     jfieldID native_library_dir_id = env->GetFieldID(env->GetObjectClass(application_info), "nativeLibraryDir", "Ljava/lang/String;");
                     if (native_library_dir_id) {
-                        auto native_library_dir_jstring = (jstring) env->GetObjectField(application_info, native_library_dir_id);
-                        auto path = env->GetStringUTFChars(native_library_dir_jstring, nullptr);
-                        std::string lib_dir(path);
-                        env->ReleaseStringUTFChars(native_library_dir_jstring, path);
-                        return lib_dir;
+                        auto jstr = (jstring) env->GetObjectField(application_info, native_library_dir_id);
+                        auto path = env->GetStringUTFChars(jstr, nullptr);
+                        std::string res(path);
+                        env->ReleaseStringUTFChars(jstr, path);
+                        return res;
                     }
                 }
             }
@@ -149,46 +138,25 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size
 
 // --- 5. 核心启动逻辑 ---
 void hack_start(const char *game_data_dir) {
-    LOGI("[🚀] 忍者全家桶 + 底层 Socket 最终布控...");
+    LOGI("[🚀] 忍者镜像抓取模式已启动...");
+    
+    // 持续监控直到找到目标
+    for (int i = 0; i < 60; i++) {
+        // 1. 先尝试 Dump 那个乱码 SO (LIAPP 核心)
+        // 名字记得根据刚才日志里看到的修改，比如 libfvctyud.so
+        dump_memory_mirror("libfvctyud.so", "liapp_core.bin");
 
-    // 方案 A: 拦截系统底层 Socket
-    void* libc_handle = dlopen("libc.so", RTLD_NOW);
-    if (libc_handle) {
-        void* sendto_addr = dlsym(libc_handle, "sendto");
-        if (sendto_addr) {
-            manual_inline_hook((uintptr_t)sendto_addr, (void*)new_sendto, (void**)&old_sendto);
-            LOGI("[✅] 系统级监控 (libc.sendto) 部署成功");
-        }
-    }
-
-    // 方案 B: 拦截业务层 (依据最新 dump.cs)
-    for (int i = 0; i < 30; i++) {
+        // 2. 同时保留传统的 il2cpp 查找，确保业务逻辑同步
         void *handle = xdl_open("libil2cpp.so", 0);
         if (handle) {
-            uintptr_t base = get_module_base("libil2cpp.so");
-            if (base) {
-                LOGI("[✅] 基址锁定: %p，业务布控开始...", (void*)base);
-
-                // 根据最新 dump.cs 地址
-                manual_inline_hook(base + 0x948D40, (void*)universal_spy); // SendPacket
-                manual_inline_hook(base + 0x948FB0, (void*)universal_spy); // ProcessSend
-                manual_inline_hook(base + 0x94FE00, (void*)universal_spy); // PacketEncrypt
-                manual_inline_hook(base + 0x9497A0, (void*)universal_spy); // OnSend
-                
-                // 实时心跳监控
-                std::thread([base]() {
-                    while (true) {
-                        unsigned char* pc = (unsigned char*)(base + 0x94FE00);
-                        LOGI("[🔍] 心跳(Encrypt): %02X %02X %02X %02X", pc[0], pc[1], pc[2], pc[3]);
-                        ::sleep(10); 
-                    }
-                }).detach();
-            }
+            LOGI("[✅] libil2cpp 已加载，执行常规 Dump...");
             il2cpp_api_init(handle);
             il2cpp_dump(game_data_dir);
+            // 找到 il2cpp 后，再强制 Dump 一次乱码库，防止它加载慢
+            dump_memory_mirror("libfvctyud.so", "liapp_core_final.bin");
             break;
         }
-        ::sleep(1);
+        ::sleep(2);
     }
 }
 
