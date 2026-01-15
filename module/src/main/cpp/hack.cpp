@@ -1,7 +1,3 @@
-//
-// Created by Perfare on 2020/7/4.
-//
-
 #include "hack.h"
 #include "il2cpp_dump.h"
 #include "log.h"
@@ -23,60 +19,43 @@
 #define LOG_TAG "IMO_NINJA"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
-// --- 补全缺失的工具函数 ---
-uintptr_t get_module_base(const char* name) {
-    FILE* fp = fopen("/proc/self/maps", "r");
-    if (!fp) return 0;
-    char line[1024];
-    uintptr_t start = 0;
-    while (fgets(line, sizeof(line), fp)) {
-        if (strstr(line, name)) {
-            start = (uintptr_t)strtoull(line, nullptr, 16);
-            break;
-        }
-    }
-    fclose(fp);
-    return start;
+// --- 1. 手动 Hook 核心：拦截与改包 ---
+void (*old_SendPacket)(void* instance, void* packet);
+
+void my_SendPacket(void* instance, void* packet) {
+    LOGI("[🔥] 拦截到发包请求！Packet地址: %p", packet);
+    
+    // 如果你想改包，就在这里通过指针操作数据
+    // old_SendPacket 指向原函数，但注意手动 Hook 可能会导致回跳崩溃
+    old_SendPacket(instance, packet);
 }
 
-void hack_start(const char *game_data_dir) {
-    bool load = false;
-    LOGI("[🚀] 正在等待 libil2cpp.so 加载...");
-    for (int i = 0; i < 30; i++) { // 增加等待时间到30秒
-        void *handle = xdl_open("libil2cpp.so", 0);
-        if (handle) {
-            load = true;
-            
-            // --- 核心点：在此处执行我们的 RVA 监控 ---
-            uintptr_t il2cpp_base = get_module_base("libil2cpp.so");
-            if (il2cpp_base != 0) {
-                LOGI("[💎] 锁定 il2cpp 基址: %p", (void*)il2cpp_base);
-                uintptr_t target_rva = 0x937C58;
-                unsigned char* pc = (unsigned char*)(il2cpp_base + target_rva);
-                LOGI("[💎] SendPacket 内存数据: %02X %02X %02X %02X %02X %02X %02X %02X", 
-                     pc[0], pc[1], pc[2], pc[3], pc[4], pc[5], pc[6], pc[7]);
-            }
-            // ------------------------------------
+void manual_inline_hook(uintptr_t target_addr, void* new_func, void** old_func_ptr) {
+    uintptr_t page_start = target_addr & ~0xFFF;
+    mprotect((void*)page_start, 4096, PROT_READ | PROT_WRITE | PROT_EXEC);
 
-            il2cpp_api_init(handle);
-            il2cpp_dump(game_data_dir);
-            break;
-        } else {
-            sleep(1);
-        }
-    }
-    if (!load) {
-        LOGI("libil2cpp.so not found in thread %d", gettid());
-    }
+    *old_func_ptr = (void*)target_addr; 
+
+    // ARM64 跳转汇编构造
+    uint32_t jmp_ins[] = {
+        0x58000050, // LDR X16, #8
+        0xd61f0200, // BR X16
+        (uint32_t)((uintptr_t)new_func & 0xFFFFFFFF),
+        (uint32_t)((uintptr_t)new_func >> 32)
+    };
+
+    memcpy((void*)target_addr, jmp_ins, sizeof(jmp_ins));
+    __builtin___clear_cache((char*)target_addr, (char*)target_addr + sizeof(jmp_ins));
+    LOGI("[✅] 手动拦截部署完成: %p", (void*)target_addr);
 }
 
-// ... GetLibDir, GetNativeBridgeLibrary, NativeBridgeCallbacks 保持不变 ...
+// --- 2. 原 Dumper 必要的系统辅助函数 (保留) ---
 
 std::string GetLibDir(JavaVM *vms) {
     JNIEnv *env = nullptr;
     vms->AttachCurrentThread(&env, nullptr);
     jclass activity_thread_clz = env->FindClass("android/app/ActivityThread");
-    if (activity_thread_clz != nullptr) {
+    if (activity_thread_clz) {
         jmethodID currentApplicationId = env->GetStaticMethodID(activity_thread_clz, "currentApplication", "()Landroid/app/Application;");
         if (currentApplicationId) {
             jobject application = env->CallStaticObjectMethod(activity_thread_clz, currentApplicationId);
@@ -89,7 +68,6 @@ std::string GetLibDir(JavaVM *vms) {
                     if (native_library_dir_id) {
                         auto native_library_dir_jstring = (jstring) env->GetObjectField(application_info, native_library_dir_id);
                         auto path = env->GetStringUTFChars(native_library_dir_jstring, nullptr);
-                        LOGI("lib dir %s", path);
                         std::string lib_dir(path);
                         env->ReleaseStringUTFChars(native_library_dir_jstring, path);
                         return lib_dir;
@@ -112,31 +90,21 @@ struct NativeBridgeCallbacks {
     void *initialize;
     void *(*loadLibrary)(const char *libpath, int flag);
     void *(*getTrampoline)(void *handle, const char *name, const char *shorty, uint32_t len);
-    void *isSupported;
-    void *getAppEnv;
-    void *isCompatibleWith;
-    void *getSignalHandler;
-    void *unloadLibrary;
-    void *getError;
-    void *isPathSupported;
-    void *initAnonymousNamespace;
-    void *createNamespace;
-    void *linkNamespaces;
-    void *(*loadLibraryExt)(const char *libpath, int flag, void *ns);
+    void *isSupported; void *getAppEnv; void *isCompatibleWith; void *getSignalHandler;
+    void *unloadLibrary; void *getError; void *isPathSupported; void *initAnonymousNamespace;
+    void *createNamespace; void *linkNamespaces; void *(*loadLibraryExt)(const char *libpath, int flag, void *ns);
 };
 
 bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size_t length) {
     sleep(5);
     auto libart = dlopen("libart.so", RTLD_NOW);
     auto JNI_GetCreatedJavaVMs = (jint (*)(JavaVM **, jsize, jsize *)) dlsym(libart, "JNI_GetCreatedJavaVMs");
-    JavaVM *vms_buf[1];
-    jsize num_vms;
+    JavaVM *vms_buf[1]; jsize num_vms;
     jint status = JNI_GetCreatedJavaVMs(vms_buf, 1, &num_vms);
     if (status != JNI_OK || num_vms <= 0) return false;
     JavaVM *vms = vms_buf[0];
     auto lib_dir = GetLibDir(vms);
     if (lib_dir.empty() || lib_dir.find("/lib/x86") != std::string::npos) return false;
-
     auto nb = dlopen("libhoudini.so", RTLD_NOW);
     if (!nb) nb = dlopen(GetNativeBridgeLibrary().data(), RTLD_NOW);
     if (nb) {
@@ -145,10 +113,8 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size
             int fd = syscall(__NR_memfd_create, "anon", MFD_CLOEXEC);
             ftruncate(fd, (off_t) length);
             void *mem = mmap(nullptr, length, PROT_WRITE, MAP_SHARED, fd, 0);
-            memcpy(mem, data, length);
-            munmap(mem, length);
-            char path[PATH_MAX];
-            snprintf(path, PATH_MAX, "/proc/self/fd/%d", fd);
+            memcpy(mem, data, length); munmap(mem, length);
+            char path[PATH_MAX]; snprintf(path, PATH_MAX, "/proc/self/fd/%d", fd);
             void *arm_handle = (api_level >= 26) ? callbacks->loadLibraryExt(path, RTLD_NOW, (void *) 3) : callbacks->loadLibrary(path, RTLD_NOW);
             if (arm_handle) {
                 auto init = (void (*)(JavaVM *, void *)) callbacks->getTrampoline(arm_handle, "JNI_OnLoad", nullptr, 0);
@@ -160,11 +126,46 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size
     return false;
 }
 
+// --- 3. 核心启动逻辑 ---
+
+void hack_start(const char *game_data_dir) {
+    LOGI("[🚀] Ninja 核心准备就绪...");
+    bool load = false;
+    for (int i = 0; i < 30; i++) {
+        void *handle = xdl_open("libil2cpp.so", 0);
+        if (handle) {
+            load = true;
+            uintptr_t il2cpp_base = 0;
+            FILE* fp = fopen("/proc/self/maps", "r");
+            if (fp) {
+                char line[1024];
+                while (fgets(line, sizeof(line), fp)) {
+                    if (strstr(line, "libil2cpp.so")) {
+                        il2cpp_base = (uintptr_t)strtoull(line, nullptr, 16);
+                        break;
+                    }
+                }
+                fclose(fp);
+            }
+
+            if (il2cpp_base != 0) {
+                // 执行拦截：NetworkManager$$SendPacket
+                uintptr_t send_addr = il2cpp_base + 0x937C58;
+                manual_inline_hook(send_addr, (void*)my_SendPacket, (void**)&old_SendPacket);
+            }
+            
+            il2cpp_api_init(handle);
+            il2cpp_dump(game_data_dir);
+            break;
+        }
+        sleep(1);
+    }
+}
+
 void hack_prepare(const char *game_data_dir, void *data, size_t length) {
     LOGI("======================================");
     LOGI(">>> Dumper 线程已启动，Ninja 开始寄生 <<<");
     LOGI("======================================");
-
     int api_level = android_get_device_api_level();
 #if defined(__i386__) || defined(__x86_64__)
     if (!NativeBridgeLoad(game_data_dir, api_level, data, length)) {
