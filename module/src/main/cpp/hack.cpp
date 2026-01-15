@@ -132,32 +132,45 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size
 
 // --- 4. 核心启动逻辑 ---
 void hack_start(const char *game_data_dir) {
-    LOGI("[🚀] 发现新版 dump.cs，重新锁定目标...");
+    LOGI("[🚀] 忍者全家桶布控中，这次务必抓到...");
     for (int i = 0; i < 30; i++) {
         void *handle = xdl_open("libil2cpp.so", 0);
         if (handle) {
             uintptr_t base = get_module_base("libil2cpp.so");
             if (base) {
-                LOGI("[✅] 基址: %p, 部署新版拦截点...", (void*)base);
+                LOGI("[✅] 基址锁定: %p，开始撒网...", (void*)base);
 
-                // --- 目标 1: 加密点 (发包明文最容易抓的地方) ---
-                uintptr_t encrypt_rva = 0x94FE00; 
-                manual_inline_hook(base + encrypt_rva, (void*)universal_spy);
+                // 根据最新 dump.cs 提取的 5 大金刚
                 
-                // --- 目标 2: 发包点 (确认行为) ---
-                uintptr_t send_rva = 0x948D40;
-                // 注意：如果 manual_inline_hook 没做指令备份，这里 Hook 两个点容易崩，我们先监视 Encrypt
-                
-                // 启动新版“心跳”监测
-                std::thread([base, encrypt_rva]() {
+                // 1. 业务发包点 (NetworkManager$$SendPacket)
+                manual_inline_hook(base + 0x948D40, (void*)universal_spy);
+                LOGI("[📌] 1. SendPacket 挂载成功");
+
+                // 2. 底层处理点 (NetworkManager$$ProcessSend)
+                manual_inline_hook(base + 0x948FB0, (void*)universal_spy);
+                LOGI("[📌] 2. ProcessSend 挂载成功");
+
+                // 3. 关键加密点 (Packet$$Encrypt) - 这个点最稳
+                manual_inline_hook(base + 0x94FE00, (void*)universal_spy);
+                LOGI("[📌] 3. PacketEncrypt 挂载成功");
+
+                // 4. Socket 写入点 (NetworkManager$$OnSend)
+                manual_inline_hook(base + 0x9497A0, (void*)universal_spy);
+                LOGI("[📌] 4. OnSend 挂载成功");
+
+                // 5. 备用加密点 (AESEncrypt256)
+                manual_inline_hook(base + 0x24190, (void*)universal_spy);
+                LOGI("[📌] 5. AESEncrypt 挂载成功");
+
+                // 实时心跳监控（依然监控 Encrypt 确认注入存活）
+                std::thread([base]() {
                     while (true) {
-                        unsigned char* pc = (unsigned char*)(base + encrypt_rva);
-                        LOGI("[🔍] 监控 Encrypt (0x94FE00) 状态: %02X %02X %02X %02X", pc[0], pc[1], pc[2], pc[3]);
-                        ::sleep(2);
+                        unsigned char* pc = (unsigned char*)(base + 0x94FE00);
+                        LOGI("[🔍] 心跳(Encrypt): %02X %02X %02X %02X", pc[0], pc[1], pc[2], pc[3]);
+                        ::sleep(5); // 改成5秒一次，别让心跳刷屏
                     }
                 }).detach();
             }
-            
             il2cpp_api_init(handle);
             il2cpp_dump(game_data_dir);
             break;
