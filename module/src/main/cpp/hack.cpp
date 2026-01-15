@@ -19,24 +19,47 @@
 #define LOG_TAG "IMO_NINJA"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
-// --- 1. 手动 Hook 核心：拦截与改包 ---
+// --- 1. 数据查看与修改核心 ---
+
+// 备份原始指令，防止闪退
+unsigned char origin_code[16]; 
 void (*old_SendPacket)(void* instance, void* packet);
 
-void my_SendPacket(void* instance, void* packet) {
-    LOGI("[🔥] 拦截到发包请求！Packet地址: %p", packet);
-    
-    // 如果你想改包，就在这里通过指针操作数据
-    // old_SendPacket 指向原函数，但注意手动 Hook 可能会导致回跳崩溃
-    old_SendPacket(instance, packet);
+// 打印数据包内容
+void dump_hex(void* addr, int len) {
+    unsigned char* p = (unsigned char*)addr;
+    char buf[128];
+    char* b = buf;
+    for (int i = 0; i < len && i < 32; i++) {
+        b += sprintf(b, "%02X ", p[i]);
+    }
+    LOGI("[📦] 数据内容: %s", buf);
 }
 
-void manual_inline_hook(uintptr_t target_addr, void* new_func, void** old_func_ptr) {
+void my_SendPacket(void* instance, void* packet) {
+    // 【看包】
+    LOGI("[🔥] 发现发包行为! 实例:%p, Packet:%p", instance, packet);
+    if (packet) {
+        // 尝试打印 packet 偏移 0 处的数据 (根据 il2cpp 结构通常是对象头)
+        dump_hex(packet, 16); 
+    }
+    
+    // 【改包】如果你想改，就在这里修改 packet 指向的内存
+    // *((uint8_t*)packet + 0x10) = 0x01; 
+
+    // 为了不崩溃，我们在调用原函数前必须先还原指令
+    // 注意：这是一种非常原始的 Hook 方式
+}
+
+// --- 2. 增强型手动拦截 ---
+void deploy_ninja_hook(uintptr_t target_addr, void* new_func) {
     uintptr_t page_start = target_addr & ~0xFFF;
     mprotect((void*)page_start, 4096, PROT_READ | PROT_WRITE | PROT_EXEC);
 
-    *old_func_ptr = (void*)target_addr; 
+    // 备份原指令
+    memcpy(origin_code, (void*)target_addr, 16);
 
-    // ARM64 跳转汇编构造
+    // 构造跳转指令 (ARM64)
     uint32_t jmp_ins[] = {
         0x58000050, // LDR X16, #8
         0xd61f0200, // BR X16
@@ -46,10 +69,10 @@ void manual_inline_hook(uintptr_t target_addr, void* new_func, void** old_func_p
 
     memcpy((void*)target_addr, jmp_ins, sizeof(jmp_ins));
     __builtin___clear_cache((char*)target_addr, (char*)target_addr + sizeof(jmp_ins));
-    LOGI("[✅] 手动拦截部署完成: %p", (void*)target_addr);
+    LOGI("[✅] 深度监控已部署: %p", (void*)target_addr);
 }
 
-// --- 2. 原 Dumper 必要的系统辅助函数 (保留) ---
+// --- 3. 补全 Dumper 必须函数 ---
 
 std::string GetLibDir(JavaVM *vms) {
     JNIEnv *env = nullptr;
@@ -86,8 +109,7 @@ static std::string GetNativeBridgeLibrary() {
 }
 
 struct NativeBridgeCallbacks {
-    uint32_t version;
-    void *initialize;
+    uint32_t version; void *initialize;
     void *(*loadLibrary)(const char *libpath, int flag);
     void *(*getTrampoline)(void *handle, const char *name, const char *shorty, uint32_t len);
     void *isSupported; void *getAppEnv; void *isCompatibleWith; void *getSignalHandler;
@@ -126,10 +148,8 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size
     return false;
 }
 
-// --- 3. 核心启动逻辑 ---
-
 void hack_start(const char *game_data_dir) {
-    LOGI("[🚀] Ninja 核心准备就绪...");
+    LOGI("[🚀] Ninja 核心准备中...");
     bool load = false;
     for (int i = 0; i < 30; i++) {
         void *handle = xdl_open("libil2cpp.so", 0);
@@ -149,9 +169,8 @@ void hack_start(const char *game_data_dir) {
             }
 
             if (il2cpp_base != 0) {
-                // 执行拦截：NetworkManager$$SendPacket
-                uintptr_t send_addr = il2cpp_base + 0x937C58;
-                manual_inline_hook(send_addr, (void*)my_SendPacket, (void**)&old_SendPacket);
+                // 修改此处：部署监控点
+                deploy_ninja_hook(il2cpp_base + 0x937C58, (void*)my_SendPacket);
             }
             
             il2cpp_api_init(handle);
@@ -163,8 +182,6 @@ void hack_start(const char *game_data_dir) {
 }
 
 void hack_prepare(const char *game_data_dir, void *data, size_t length) {
-    LOGI("======================================");
-    LOGI(">>> Dumper 线程已启动，Ninja 开始寄生 <<<");
     LOGI("======================================");
     int api_level = android_get_device_api_level();
 #if defined(__i386__) || defined(__x86_64__)
