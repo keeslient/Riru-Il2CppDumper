@@ -19,58 +19,71 @@
 #define LOG_TAG "IMO_NINJA"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
-// --- 1. 数据查看与修改核心 ---
-
-// 备份原始指令，防止闪退
-unsigned char origin_code[16]; 
-void (*old_SendPacket)(void* instance, void* packet);
-
-// 打印数据包内容
-void dump_hex(void* addr, int len) {
-    unsigned char* p = (unsigned char*)addr;
-    char buf[128];
-    char* b = buf;
-    for (int i = 0; i < len && i < 32; i++) {
-        b += sprintf(b, "%02X ", p[i]);
-    }
-    LOGI("[📦] 数据内容: %s", buf);
+// --- 1. 监控回调 ---
+// 我们用同一个回调来测试，看看到底谁会被触发
+void universal_spy(void* instance, void* arg1) {
+    LOGI("[🔥] 捕获到动作！实例: %p, 参数: %p", instance, arg1);
 }
 
-void my_SendPacket(void* instance, void* packet) {
-    // 【看包】
-    LOGI("[🔥] 发现发包行为! 实例:%p, Packet:%p", instance, packet);
-    if (packet) {
-        // 尝试打印 packet 偏移 0 处的数据 (根据 il2cpp 结构通常是对象头)
-        dump_hex(packet, 16); 
-    }
-    
-    // 【改包】如果你想改，就在这里修改 packet 指向的内存
-    // *((uint8_t*)packet + 0x10) = 0x01; 
-
-    // 为了不崩溃，我们在调用原函数前必须先还原指令
-    // 注意：这是一种非常原始的 Hook 方式
-}
-
-// --- 2. 增强型手动拦截 ---
-void deploy_ninja_hook(uintptr_t target_addr, void* new_func) {
+void manual_inline_hook(uintptr_t target_addr, void* new_func) {
     uintptr_t page_start = target_addr & ~0xFFF;
     mprotect((void*)page_start, 4096, PROT_READ | PROT_WRITE | PROT_EXEC);
-
-    // 备份原指令
-    memcpy(origin_code, (void*)target_addr, 16);
-
-    // 构造跳转指令 (ARM64)
     uint32_t jmp_ins[] = {
         0x58000050, // LDR X16, #8
         0xd61f0200, // BR X16
         (uint32_t)((uintptr_t)new_func & 0xFFFFFFFF),
         (uint32_t)((uintptr_t)new_func >> 32)
     };
-
     memcpy((void*)target_addr, jmp_ins, sizeof(jmp_ins));
     __builtin___clear_cache((char*)target_addr, (char*)target_addr + sizeof(jmp_ins));
-    LOGI("[✅] 深度监控已部署: %p", (void*)target_addr);
 }
+
+// --- 2. 核心启动逻辑 ---
+void hack_start(const char *game_data_dir) {
+    LOGI("[🚀] Ninja 正在扫描目标函数...");
+    for (int i = 0; i < 30; i++) {
+        void *handle = xdl_open("libil2cpp.so", 0);
+        if (handle) {
+            uintptr_t base = 0;
+            FILE* fp = fopen("/proc/self/maps", "r");
+            if (fp) {
+                char line[1024];
+                while (fgets(line, sizeof(line), fp)) {
+                    if (strstr(line, "libil2cpp.so")) {
+                        base = (uintptr_t)strtoull(line, nullptr, 16);
+                        break;
+                    }
+                }
+                fclose(fp);
+            }
+
+            if (base != 0) {
+                // 尝试 Hook 三个点
+                LOGI("[✅] 基址锁定: %p, 开始布控...", (void*)base);
+                
+                // 点位1: SendPacket (0x937C58)
+                manual_inline_hook(base + 0x937C58, (void*)universal_spy);
+                LOGI("[📌] 监控点 A (SendPacket) 已就绪");
+
+                // 点位2: ProcessSend (0x937ED4)
+                manual_inline_hook(base + 0x937ED4, (void*)universal_spy);
+                LOGI("[📌] 监控点 B (ProcessSend) 已就绪");
+
+                // 点位3: Encrypt (0x93EBDC) - 强烈推荐此点
+                manual_inline_hook(base + 0x93EBDC, (void*)universal_spy);
+                LOGI("[📌] 监控点 C (Encrypt) 已就绪");
+            }
+            
+            il2cpp_api_init(handle);
+            il2cpp_dump(game_data_dir);
+            break;
+        }
+        sleep(1);
+    }
+}
+
+// --- 以下代码保持原样 (GetLibDir, NativeBridgeLoad, hack_prepare, JNI_OnLoad) ---
+// 为了篇幅，我略写了，请确保你覆盖时保留这些函数
 
 // --- 3. 补全 Dumper 必须函数 ---
 
