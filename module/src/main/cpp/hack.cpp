@@ -137,24 +137,44 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size
 }
 
 // --- 5. 核心启动逻辑 ---
+// 在 hack_start 里加入这段智能扫描代码
 void hack_start(const char *game_data_dir) {
-    LOGI("[🚀] 忍者镜像抓取模式已启动...");
+    LOGI("[🚀] 智能抄家模式启动...");
     
-    // 持续监控直到找到目标
     for (int i = 0; i < 60; i++) {
-        // 1. 先尝试 Dump 那个乱码 SO (LIAPP 核心)
-        // 名字记得根据刚才日志里看到的修改，比如 libfvctyud.so
-        dump_memory_mirror("libfvctyud.so", "liapp_core.bin");
+        // 自动寻找那个“乱码 SO”
+        FILE* fp = fopen("/proc/self/maps", "r");
+        if (fp) {
+            char line[1024];
+            while (fgets(line, sizeof(line), fp)) {
+                // 特征码过滤：找那些在 /data/app 目录下，但不是 libmain、libunity、libil2cpp 的 .so
+                if (strstr(line, ".so") && strstr(line, "/data/app") && 
+                    !strstr(line, "libmain.so") && !strstr(line, "libunity.so") && 
+                    !strstr(line, "libil2cpp.so") && !strstr(line, "libreal.so")) {
+                    
+                    // 提取这个可疑 SO 的名字
+                    char* so_path = strchr(line, '/');
+                    char* so_name = strrchr(so_path, '/');
+                    if (so_name) {
+                        so_name++; // 跳过 '/'
+                        // 去掉换行符
+                        so_name[strcspn(so_name, "\n")] = 0;
+                        
+                        LOGI("[🎯] 发现可疑 LIAPP 核心库: %s", so_name);
+                        dump_memory_mirror(so_name, "liapp_core_auto.bin");
+                    }
+                }
+            }
+            fclose(fp);
+        }
 
-        // 2. 同时保留传统的 il2cpp 查找，确保业务逻辑同步
+        // 同时检查 il2cpp
         void *handle = xdl_open("libil2cpp.so", 0);
         if (handle) {
-            LOGI("[✅] libil2cpp 已加载，执行常规 Dump...");
+            LOGI("[✅] libil2cpp 已加载，常规 Dump 启动...");
             il2cpp_api_init(handle);
             il2cpp_dump(game_data_dir);
-            // 找到 il2cpp 后，再强制 Dump 一次乱码库，防止它加载慢
-            dump_memory_mirror("libfvctyud.so", "liapp_core_final.bin");
-            break;
+            break; 
         }
         ::sleep(2);
     }
