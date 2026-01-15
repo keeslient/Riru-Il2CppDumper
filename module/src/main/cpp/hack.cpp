@@ -20,73 +20,26 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
 // --- 1. 监控回调 ---
-// 我们用同一个回调来测试，看看到底谁会被触发
 void universal_spy(void* instance, void* arg1) {
     LOGI("[🔥] 捕获到动作！实例: %p, 参数: %p", instance, arg1);
 }
 
+// --- 2. 手动 Hook 核心 ---
 void manual_inline_hook(uintptr_t target_addr, void* new_func) {
     uintptr_t page_start = target_addr & ~0xFFF;
-    mprotect((void*)page_start, 4096, PROT_READ | PROT_WRITE | PROT_EXEC);
-    uint32_t jmp_ins[] = {
-        0x58000050, // LDR X16, #8
-        0xd61f0200, // BR X16
-        (uint32_t)((uintptr_t)new_func & 0xFFFFFFFF),
-        (uint32_t)((uintptr_t)new_func >> 32)
-    };
-    memcpy((void*)target_addr, jmp_ins, sizeof(jmp_ins));
-    __builtin___clear_cache((char*)target_addr, (char*)target_addr + sizeof(jmp_ins));
-}
-
-// --- 2. 核心启动逻辑 ---
-void hack_start(const char *game_data_dir) {
-    LOGI("[🚀] Ninja 正在扫描目标函数...");
-    for (int i = 0; i < 30; i++) {
-        void *handle = xdl_open("libil2cpp.so", 0);
-        if (handle) {
-            uintptr_t base = 0;
-            FILE* fp = fopen("/proc/self/maps", "r");
-            if (fp) {
-                char line[1024];
-                while (fgets(line, sizeof(line), fp)) {
-                    if (strstr(line, "libil2cpp.so")) {
-                        base = (uintptr_t)strtoull(line, nullptr, 16);
-                        break;
-                    }
-                }
-                fclose(fp);
-            }
-
-            if (base != 0) {
-                // 尝试 Hook 三个点
-                LOGI("[✅] 基址锁定: %p, 开始布控...", (void*)base);
-                
-                // 点位1: SendPacket (0x937C58)
-                manual_inline_hook(base + 0x937C58, (void*)universal_spy);
-                LOGI("[📌] 监控点 A (SendPacket) 已就绪");
-
-                // 点位2: ProcessSend (0x937ED4)
-                manual_inline_hook(base + 0x937ED4, (void*)universal_spy);
-                LOGI("[📌] 监控点 B (ProcessSend) 已就绪");
-
-                // 点位3: Encrypt (0x93EBDC) - 强烈推荐此点
-                manual_inline_hook(base + 0x93EBDC, (void*)universal_spy);
-                LOGI("[📌] 监控点 C (Encrypt) 已就绪");
-            }
-            
-            il2cpp_api_init(handle);
-            il2cpp_dump(game_data_dir);
-            break;
-        }
-        sleep(1);
+    if (mprotect((void*)page_start, 4096, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+        uint32_t jmp_ins[] = {
+            0x58000050, // LDR X16, #8
+            0xd61f0200, // BR X16
+            (uint32_t)((uintptr_t)new_func & 0xFFFFFFFF),
+            (uint32_t)((uintptr_t)new_func >> 32)
+        };
+        memcpy((void*)target_addr, jmp_ins, sizeof(jmp_ins));
+        __builtin___clear_cache((char*)target_addr, (char*)target_addr + sizeof(jmp_ins));
     }
 }
 
-// --- 以下代码保持原样 (GetLibDir, NativeBridgeLoad, hack_prepare, JNI_OnLoad) ---
-// 为了篇幅，我略写了，请确保你覆盖时保留这些函数
-
 // --- 3. 补全 Dumper 必须函数 ---
-
 std::string GetLibDir(JavaVM *vms) {
     JNIEnv *env = nullptr;
     vms->AttachCurrentThread(&env, nullptr);
@@ -161,6 +114,7 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size
     return false;
 }
 
+// --- 4. 核心启动逻辑 ---
 void hack_start(const char *game_data_dir) {
     LOGI("[🚀] Ninja 核心准备中...");
     bool load = false;
@@ -168,22 +122,32 @@ void hack_start(const char *game_data_dir) {
         void *handle = xdl_open("libil2cpp.so", 0);
         if (handle) {
             load = true;
-            uintptr_t il2cpp_base = 0;
+            uintptr_t base = 0;
             FILE* fp = fopen("/proc/self/maps", "r");
             if (fp) {
                 char line[1024];
                 while (fgets(line, sizeof(line), fp)) {
                     if (strstr(line, "libil2cpp.so")) {
-                        il2cpp_base = (uintptr_t)strtoull(line, nullptr, 16);
+                        base = (uintptr_t)strtoull(line, nullptr, 16);
                         break;
                     }
                 }
                 fclose(fp);
             }
 
-            if (il2cpp_base != 0) {
-                // 修改此处：部署监控点
-                deploy_ninja_hook(il2cpp_base + 0x937C58, (void*)my_SendPacket);
+            if (base != 0) {
+                LOGI("[✅] 基址锁定: %p, 开始三路布控...", (void*)base);
+                // 点位1: SendPacket (0x937C58)
+                manual_inline_hook(base + 0x937C58, (void*)universal_spy);
+                LOGI("[📌] 监控点 A 就绪");
+
+                // 点位2: ProcessSend (0x937ED4)
+                manual_inline_hook(base + 0x937ED4, (void*)universal_spy);
+                LOGI("[📌] 监控点 B 就绪");
+
+                // 点位3: Encrypt (0x93EBDC)
+                manual_inline_hook(base + 0x93EBDC, (void*)universal_spy);
+                LOGI("[📌] 监控点 C 就绪");
             }
             
             il2cpp_api_init(handle);
