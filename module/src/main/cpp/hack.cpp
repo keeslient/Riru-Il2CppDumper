@@ -19,6 +19,22 @@
 #define LOG_TAG "IMO_NINJA"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
+// --- 补全缺失的工具函数 ---
+uintptr_t get_module_base(const char* name) {
+    FILE* fp = fopen("/proc/self/maps", "r");
+    if (!fp) return 0;
+    char line[1024];
+    uintptr_t start = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, name)) {
+            start = (uintptr_t)strtoull(line, nullptr, 16);
+            break;
+        }
+    }
+    fclose(fp);
+    return start;
+}
+
 // --- 1. 监控回调 ---
 void universal_spy(void* instance, void* arg1) {
     LOGI("[🔥] 捕获到动作！实例: %p, 参数: %p", instance, arg1);
@@ -84,7 +100,7 @@ struct NativeBridgeCallbacks {
 };
 
 bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size_t length) {
-    sleep(5);
+    ::sleep(5);
     auto libart = dlopen("libart.so", RTLD_NOW);
     auto JNI_GetCreatedJavaVMs = (jint (*)(JavaVM **, jsize, jsize *)) dlsym(libart, "JNI_GetCreatedJavaVMs");
     JavaVM *vms_buf[1]; jsize num_vms;
@@ -93,8 +109,8 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size
     JavaVM *vms = vms_buf[0];
     auto lib_dir = GetLibDir(vms);
     if (lib_dir.empty() || lib_dir.find("/lib/x86") != std::string::npos) return false;
-    auto nb = dlopen("libhoudini.so", RTLD_NOW);
-    if (!nb) nb = dlopen(GetNativeBridgeLibrary().data(), RTLD_NOW);
+    auto nb = ::dlopen("libhoudini.so", RTLD_NOW);
+    if (!nb) nb = ::dlopen(GetNativeBridgeLibrary().data(), RTLD_NOW);
     if (nb) {
         auto callbacks = (NativeBridgeCallbacks *) dlsym(nb, "NativeBridgeItf");
         if (callbacks) {
@@ -116,7 +132,7 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size
 
 // --- 4. 核心启动逻辑 ---
 void hack_start(const char *game_data_dir) {
-    LOGI("[🚀] 忍者扫描器已就位...");
+    LOGI("[🚀] 忍者扫描器正在启动...");
     for (int i = 0; i < 30; i++) {
         void *handle = xdl_open("libil2cpp.so", 0);
         if (handle) {
@@ -124,16 +140,15 @@ void hack_start(const char *game_data_dir) {
             if (base) {
                 LOGI("[✅] 锁定游戏基址: %p", (void*)base);
 
-                // 部署 Hook
+                // 部署监控 (RVA: 0x937C58)
                 manual_inline_hook(base + 0x937C58, (void*)universal_spy);
                 
-                // --- 核心：启动内存监视器 ---
+                // 启动“心跳”监测线程
                 std::thread([base]() {
                     while (true) {
                         unsigned char* pc = (unsigned char*)(base + 0x937C58);
-                        // 打印当前内存前4字节，看我们的跳转指令 (50 00 00 58) 还在不在
                         LOGI("[🔍] 内存实时状态: %02X %02X %02X %02X", pc[0], pc[1], pc[2], pc[3]);
-                        sleep(2);
+                        ::sleep(2);
                     }
                 }).detach();
             }
@@ -142,7 +157,7 @@ void hack_start(const char *game_data_dir) {
             il2cpp_dump(game_data_dir);
             break;
         }
-        sleep(1);
+        ::sleep(1);
     }
 }
 
