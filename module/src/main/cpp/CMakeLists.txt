@@ -34,19 +34,22 @@ set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${LINKER_FLAGS}")
 set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} ${LINKER_FLAGS}")
 
 # ==============================================================================
-# 3. 【绝对稳妥】下载官方源码 + 自动修补汇编错误
+# 3. 【精准修复】下载 Dobby 并按顺序修补汇编
 # ==============================================================================
 include(FetchContent)
 
 message(STATUS "Downloading Official Dobby & Patching for NDK25...")
 
-# 1. 下载官方 master 分支 (100% 存在)
-# 2. 使用 PATCH_COMMAND 自动修改 asm 文件，移除 NDK25 不支持的 @PAGE 写法
+# 解释：
+# 1. 下载官方 master.zip (HTTP下载，避开 Git 权限问题)
+# 2. PATCH_COMMAND: 使用 sed 同时处理 @PAGEOFF 和 @PAGE
+#    注意顺序：必须先删 @PAGEOFF，否则会留下 OFF 尾巴导致编译失败！
 FetchContent_Declare(
   dobby
   URL https://github.com/jmpews/Dobby/archive/refs/heads/master.zip
-  PATCH_COMMAND sed -i "s/@PAGE//g" ${CMAKE_CURRENT_BINARY_DIR}/_deps/dobby-src/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm
+  PATCH_COMMAND sed -i "s/@PAGEOFF//g;s/@PAGE//g" ${CMAKE_CURRENT_BINARY_DIR}/_deps/dobby-src/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm
 )
+
 # 解压并配置
 FetchContent_MakeAvailable(dobby)
 
