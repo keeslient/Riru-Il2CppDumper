@@ -14,75 +14,152 @@
 #include <vector>
 #include <iomanip>
 #include <sstream>
+#include <string>
+#include <array>
+#include <link.h>
 
-// ------------------------------------------------------------------
-// 直接从 maps 读取基地址 (专门找 libil2cpp.so)
-// ------------------------------------------------------------------
-void* GetIl2CppBase() {
-    FILE* fp = fopen("/proc/self/maps", "r");
+// =============================================================
+// 0. 基础设置与防报错声明
+// =============================================================
+
+#define LOG_TAG "Perfare"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+
+// 手动声明 DobbyHook，防止编译找不到符号
+// 如果你的项目里有 dobby.h，也可以 include，但这样写最稳
+extern "C" {
+    int DobbyHook(void *address, void *replace_call, void **origin_call);
+}
+
+// =============================================================
+// 1. 辅助工具：Hex 转字符串 (用于打印发包内容)
+// =============================================================
+std::string hexStr(unsigned char *data, int len) {
+    std::stringstream ss;
+    ss << std::hex;
+    for (int i = 0; i < len; ++i)
+        ss << std::setw(2) << std::setfill('0') << (int)data[i] << " ";
+    return ss.str();
+}
+
+// =============================================================
+// 2. Hook 函数定义
+// =============================================================
+
+// 原始函数指针
+// 对应 dump.cs 里的 PacketEncode (RVA: 0x11b54c8)
+void (*old_PacketEncode)(void* instance, void* packet, bool flag);
+
+// 我们的新函数
+void new_PacketEncode(void* instance, void* packet, bool flag) {
+    LOGI(">>> [PacketEncode] 触发! Obj: %p, Flag: %d", packet, flag);
+    
+    // 简单打印一下 packet 指针指向的前 32 字节数据，看看是不是封包内容
+    if (packet != nullptr) {
+        // 这里的转换可能会因为内存不可读导致崩溃，先试探性读取
+        // 如果闪退，把这行 LOG 注释掉即可
+        // LOGI("Packet Data Head: %s", hexStr((unsigned char*)packet, 32).c_str());
+    }
+
+    // 必须调用原函数，保证游戏逻辑正常
+    if(old_PacketEncode) old_PacketEncode(instance, packet, flag);
+}
+
+// =============================================================
+// 3. 核心逻辑：寻找真正的 il2cpp 基址 (体积策略)
+// =============================================================
+void* FindRealIl2CppBase() {
+    FILE *fp = fopen("/proc/self/maps", "r");
     if (!fp) return nullptr;
 
     char line[2048];
-    void* addr = nullptr;
+    void* best_addr = nullptr;
+    unsigned long max_size = 0;
 
     while (fgets(line, sizeof(line), fp)) {
-        // 只要行里包含 "libil2cpp.so" 且是可执行段 (r-xp)
-        if (strstr(line, "libil2cpp.so") && strstr(line, "r-xp")) {
-            unsigned long start_addr;
-            if (sscanf(line, "%lx-", &start_addr) == 1) {
-                addr = (void*)start_addr;
-                // 这里可以顺便打印一下找到的行，确认是不是那个大文件
-                __android_log_print(ANDROID_LOG_INFO, "Perfare", "Maps Found: %s", line);
-                break;
+        // 必须是可执行段 (r-xp)
+        if (strstr(line, "r-xp")) {
+            // 必须在 /data/app 下 (或者是 split_config 等安装路径)
+            if (strstr(line, "/data/app") && strstr(line, ".so")) {
+                
+                // 排除已知的非目标库
+                if (strstr(line, "libunity.so") || 
+                    strstr(line, "libmain.so") || 
+                    strstr(line, "base.odex") || 
+                    strstr(line, "webview")) continue;
+
+                unsigned long start, end;
+                if (sscanf(line, "%lx-%lx", &start, &end) == 2) {
+                    unsigned long size = end - start;
+                    
+                    // 核心逻辑：真正的 il2cpp 通常很大 (比如 > 30MB)
+                    // 那个 libfvctyud.so 只有几百KB，会被直接忽略
+                    if (size > 1024 * 1024 * 30) { 
+                        // 如果发现了比之前更大的，就更新目标
+                        if (size > max_size) {
+                            max_size = size;
+                            best_addr = (void*)start;
+                            LOGI("发现潜在目标 (Size: %lu bytes): %s", size, line);
+                        }
+                    }
+                }
             }
         }
     }
     fclose(fp);
-    return addr;
+    
+    return best_addr;
 }
 
-// ------------------------------------------------------------------
-// 主逻辑
-// ------------------------------------------------------------------
+// =============================================================
+// 4. 主线程逻辑
+// =============================================================
 void hack_start(const char *game_data_dir) {
-    __android_log_print(ANDROID_LOG_INFO, "Perfare", ">>> HACK START: 正在等待真正的 libil2cpp.so 加载... <<<");
+    LOGI(">>> HACK START: 正在寻找真正的 il2cpp 大文件... <<<");
 
     void* base_addr = nullptr;
     
-    // 死循环等待，LIAPP 解密需要时间，我们就在这等它解密完
+    // 死循环等待，直到找到一个足够大的模块
+    // 这样能完美解决“启动太早”的问题
     while (true) {
-        base_addr = GetIl2CppBase();
+        base_addr = FindRealIl2CppBase();
         
         if (base_addr != nullptr) {
-            __android_log_print(ANDROID_LOG_INFO, "Perfare", "!!! 捕获真身 !!! libil2cpp Base: %p", base_addr);
+            LOGI("!!! 锁定真身 !!! Base Address: %p", base_addr);
             break;
         }
         
+        // 没找到就睡 1 秒继续找
         sleep(1);
     }
 
     // ---------------------------------------------------------
-    // 这里的偏移量一定要用你 dump.cs 里的！
+    // 执行 Hook
     // ---------------------------------------------------------
     
-    // 例如 PacketEncode 的 RVA 是 0x11b54c8 (根据你之前的描述)
-    // 真实地址 = base_addr + 0x11b54c8
+    // 偏移量来自 dump.cs 的 PacketEncode 方法
+    uintptr_t offset_PacketEncode = 0x11b54c8; 
     
-    // uintptr_t offset = 0x11b54c8; 
-    // void* target_addr = (void*)((uintptr_t)base_addr + offset);
-    
-    // __android_log_print(ANDROID_LOG_INFO, "Perfare", ">>> Hook 点已就绪: %p <<<", target_addr);
+    void* target_addr = (void*)((uintptr_t)base_addr + offset_PacketEncode);
+    LOGI(">>> 准备 Hook 地址: %p (Base+0x%lx) <<<", target_addr, offset_PacketEncode);
 
-    // 在这里执行 DobbyHook ...
+    // 执行 Dobby Hook
+    // 如果这里还不行，那可能就是 LIAPP 对内存代码段做了完整性校验
+    int ret = DobbyHook(target_addr, (void*)new_PacketEncode, (void**)&old_PacketEncode);
     
+    if (ret == 0) {
+        LOGI(">>> DobbyHook 返回成功! 监控中... <<<");
+    } else {
+        LOGI(">>> DobbyHook 失败，返回值: %d <<<", ret);
+    }
+    
+    // 保持线程存活，防止 Hook 被回收
     while(true) sleep(10);
 }
 
-// 下面的 NativeBridgeLoad / JNI_OnLoad 保持原样...
-
-// ------------------------------------------------------------------
-// 下面的 NativeBridgeLoad 等保持原样，为了过编译我不删了
-// ------------------------------------------------------------------
+// =============================================================
+// 5. 固定模板代码 (NativeBridge & JNI入口)
+// =============================================================
 
 std::string GetLibDir(JavaVM *vms) {
     JNIEnv *env = nullptr;
