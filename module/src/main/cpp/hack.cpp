@@ -23,44 +23,55 @@
 // -------------------------------------------------------------
 // 只修改了这里：尝试捕捉真身 libliapp.so
 // -------------------------------------------------------------
+#include <fstream>
+#include <string>
+#include <unistd.h> // for sleep
+
 void hack_start(const char *game_data_dir) {
-    __android_log_print(ANDROID_LOG_INFO, "Perfare", ">>> HACK START: 开始扫描内存映射Maps <<<");
+    __android_log_print(ANDROID_LOG_INFO, "Perfare", ">>> HACK START: Monitoring Memory Maps... <<<");
 
-    // 打开当前进程的内存映射文件
-    FILE *fp = fopen("/proc/self/maps", "r");
-    if (fp == nullptr) {
-        __android_log_print(ANDROID_LOG_INFO, "Perfare", "FATAL: 无法读取 /proc/self/maps");
-        return;
-    }
+    // 无限循环监控，直到找到目标或者你手动关闭游戏
+    int retry_count = 0;
+    while (true) {
+        FILE *fp = fopen("/proc/self/maps", "r");
+        if (fp == nullptr) {
+            sleep(1);
+            continue;
+        }
 
-    char line[1024];
-    while (fgets(line, sizeof(line), fp)) {
-        // maps 的格式通常是：
-        // 7c00000000-7c00001000 r-xp 00000000 fd:00 12345 /data/app/..../libxxx.so
+        bool found_something_new = false;
+        char line[2048]; // 加大缓冲区，防止行太长截断
         
-        // 我们只关心两个特征：
-        // 1. 它是可执行的 (包含 "r-xp")
-        // 2. 它的路径在 /data/app 里 (或者是匿名内存)
-        
-        if (strstr(line, "r-xp")) {
-            // 过滤掉系统库 (system/lib64)，只看游戏自己的
-            if (strstr(line, "/data/app") || strstr(line, "/data/data")) {
-                // 打印出来！真身就在这里面！
-                // 重点看有没有名字很奇怪的 .so，或者名字带有 split_config 的
-                __android_log_print(ANDROID_LOG_INFO, "Perfare", "发现可疑模块: %s", line);
-            }
-            // 有时候 LIAPP 会把代码放在匿名段里，没有文件名
-            else if (!strstr(line, "/")) {
-                 // 这种通常是 [anon:libc_malloc] 或者纯粹的地址
-                 // 量可能很大，暂不打印，先看上面那些有名字的
+        while (fgets(line, sizeof(line), fp)) {
+            // 筛选条件：
+            // 1. 必须是可执行段 (r-xp)
+            // 2. 路径在 /data/app (安装包内) 或者 /data/user (解压的数据)
+            if (strstr(line, "r-xp") && (strstr(line, "/data/app") || strstr(line, "/data/user") || strstr(line, "liapp"))) {
+                
+                // 过滤掉已知的普通库，减少刷屏 (可根据需要添加)
+                if (strstr(line, "libunity.so") || strstr(line, "libmain.so")) continue;
+
+                // 打印发现的可疑目标！
+                // 重点看：split_config, libliapp.so, 或者名字很乱的so
+                __android_log_print(ANDROID_LOG_INFO, "Perfare", "[Found Module] %s", line);
+                found_something_new = true;
             }
         }
-    }
-    fclose(fp);
-    
-    __android_log_print(ANDROID_LOG_INFO, "Perfare", ">>> 扫描结束 <<<");
-}
+        fclose(fp);
 
+        if (found_something_new) {
+            __android_log_print(ANDROID_LOG_INFO, "Perfare", "----------------------------------------");
+        }
+
+        // 每次扫完，打印个心跳，证明还在活捉
+        if (retry_count % 5 == 0) { 
+             __android_log_print(ANDROID_LOG_INFO, "Perfare", ">>> Scanner Still Alive... (Count: %d) <<<", retry_count);
+        }
+
+        retry_count++;
+        sleep(3); // 每3秒扫一次，给游戏加载的时间
+    }
+}
 // -------------------------------------------------------------
 // 以下部分完全保持你提供的源码原样，一个字符都不动
 // -------------------------------------------------------------
