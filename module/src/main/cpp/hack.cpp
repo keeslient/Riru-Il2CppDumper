@@ -15,9 +15,36 @@
 #include <android/log.h>
 #include <cstdlib>
 #include <string>
+#include <signal.h>
+#include <ucontext.h>
 
 #define LOG_TAG "IMO_NINJA"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+
+// --- 全局变量：用于陷阱监控 ---
+static uintptr_t global_sbox_addr = 0;
+static uintptr_t global_so_base = 0;
+static const uintptr_t SBOX_OFFSET = 0x89F90; // AES S-Box 偏移
+
+// --- 信号处理函数：捕获加密现场 ---
+void sbox_trap_handler(int sig, siginfo_t *info, void *context) {
+    auto* ctx = (ucontext_t*)context;
+    uintptr_t pc = ctx->uc_mcontext.pc;
+    uintptr_t relative_pc = pc - global_so_base;
+
+    LOGI("================ [🚨 捕获加密动作] ================");
+    LOGI("[🎯] 触发指令偏移 (PC): 0x%lx", (long)relative_pc);
+    
+    // 打印前 8 个寄存器，寻找明文和 Key 的线索
+    for(int i = 0; i < 8; i++) {
+        LOGI("[💎] 寄存器 X%d: 0x%llx", i, ctx->uc_mcontext.regs[i]);
+    }
+
+    // 必须恢复权限，否则 CPU 无法完成当前指令，会导致死循环
+    mprotect((void*)(global_sbox_addr & ~0xFFF), 4096, PROT_READ);
+    LOGI("[✅] 陷阱已触发，权限已临时恢复，请分析上方寄存器。");
+    LOGI("==================================================");
+}
 
 // --- 工具函数：获取模块基址 ---
 uintptr_t get_module_base(const char* name) {
@@ -36,28 +63,35 @@ uintptr_t get_module_base(const char* name) {
 }
 
 // --- 核心：内存镜像 Dump 函数 ---
-// 只要能读到内存，就能把它导出来分析，绕过所有 Hook 检测
 void dump_memory_mirror(const char* so_name, const char* out_name) {
     uintptr_t base = get_module_base(so_name);
     if (!base) return;
 
+    global_so_base = base; // 记录基址供陷阱使用
     LOGI("[📡] 发现目标库 %s，基址: %p，准备抄家...", so_name, (void*)base);
 
-    // 假设乱码库大小 4MB，我们 Dump 8MB 确保万无一失
     size_t dump_size = 8 * 1024 * 1024; 
     char path[256];
-    // 存放在游戏私有目录，避免权限问题
     sprintf(path, "/sdcard/Android/data/com.com2us.imo.normal.freefull.google.global.android.common/files/%s", out_name);
 
     FILE* fp = fopen(path, "wb");
     if (fp) {
-        // 使用最稳妥的 fwrite 读内存
         fwrite((void*)base, 1, dump_size, fp);
         fclose(fp);
         LOGI("[✅] 抄家成功！镜像已保存至: %s", path);
-        LOGI("[💡] 请将此文件拉到电脑，搜索你的 Wireshark 特征码或分析 SVC 指令");
-    } else {
-        LOGI("[❌] 导出失败，请检查 SD 卡权限或目录是否存在");
+    }
+
+    // --- 在此处顺便布下捕兽夹 ---
+    global_sbox_addr = base + SBOX_OFFSET;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_flags = SA_SIGINFO;
+    sa.sa_sigaction = sbox_trap_handler;
+    sigaction(SIGSEGV, &sa, NULL);
+
+    // 将 S 盒所在页设为不可访问
+    if (mprotect((void*)(global_sbox_addr & ~0xFFF), 4096, PROT_NONE) == 0) {
+        LOGI("[🪤] 针对 %s 的 AES 陷阱已布好！", so_name);
     }
 }
 
@@ -136,31 +170,25 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size
     return false;
 }
 
-// --- 5. 核心启动逻辑 ---
-// 在 hack_start 里加入这段智能扫描代码
 void hack_start(const char *game_data_dir) {
-    LOGI("[🚀] 智能抄家模式启动...");
+    LOGI("[🚀] 整合版智能抄家 + 陷阱模式启动...");
     
     for (int i = 0; i < 60; i++) {
-        // 自动寻找那个“乱码 SO”
         FILE* fp = fopen("/proc/self/maps", "r");
         if (fp) {
             char line[1024];
             while (fgets(line, sizeof(line), fp)) {
-                // 特征码过滤：找那些在 /data/app 目录下，但不是 libmain、libunity、libil2cpp 的 .so
                 if (strstr(line, ".so") && strstr(line, "/data/app") && 
                     !strstr(line, "libmain.so") && !strstr(line, "libunity.so") && 
                     !strstr(line, "libil2cpp.so") && !strstr(line, "libreal.so")) {
                     
-                    // 提取这个可疑 SO 的名字
                     char* so_path = strchr(line, '/');
                     char* so_name = strrchr(so_path, '/');
                     if (so_name) {
-                        so_name++; // 跳过 '/'
-                        // 去掉换行符
+                        so_name++; 
                         so_name[strcspn(so_name, "\n")] = 0;
                         
-                        LOGI("[🎯] 发现可疑 LIAPP 核心库: %s", so_name);
+                        // 调用 Dump 并在内部布下陷阱
                         dump_memory_mirror(so_name, "liapp_core_auto.bin");
                     }
                 }
@@ -168,10 +196,9 @@ void hack_start(const char *game_data_dir) {
             fclose(fp);
         }
 
-        // 同时检查 il2cpp
         void *handle = xdl_open("libil2cpp.so", 0);
         if (handle) {
-            LOGI("[✅] libil2cpp 已加载，常规 Dump 启动...");
+            LOGI("[✅] libil2cpp 已加载，常规 Dumper 启动...");
             il2cpp_api_init(handle);
             il2cpp_dump(game_data_dir);
             break; 
