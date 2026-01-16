@@ -27,22 +27,37 @@ static uintptr_t global_so_base = 0;
 static const uintptr_t SBOX_OFFSET = 0x89F90; // AES S-Box 偏移
 
 // --- 1. 信号处理函数 (捕兽夹核心) ---
+// --- 1. 信号处理函数 (适配 32/64 位) ---
 void sbox_trap_handler(int sig, siginfo_t *info, void *context) {
     auto* ctx = (ucontext_t*)context;
-    uintptr_t pc = ctx->uc_mcontext.pc;
-    uintptr_t relative_pc = pc - global_so_base;
+    uintptr_t pc = 0;
 
     LOGI("================ [🚨 捕获加密动作] ================");
-    LOGI("[🎯] 触发指令偏移 (PC): 0x%lx", (long)relative_pc);
+
+#if defined(__aarch64__)
+    // 64 位模式
+    pc = ctx->uc_mcontext.pc;
+    uintptr_t relative_pc = pc - global_so_base;
+    LOGI("[🎯] 触发指令偏移 (PC): 0x%lx (64-bit)", (long)relative_pc);
     
-    // 打印前 8 个通用寄存器，寻找明文指针
     for(int i = 0; i < 8; i++) {
         LOGI("[💎] 寄存器 X%d: 0x%llx", i, (unsigned long long)ctx->uc_mcontext.regs[i]);
     }
+#elif defined(__arm__)
+    // 32 位模式 (armeabi-v7a)
+    pc = ctx->uc_mcontext.arm_pc;
+    uintptr_t relative_pc = pc - global_so_base;
+    LOGI("[🎯] 触发指令偏移 (PC): 0x%lx (32-bit)", (long)relative_pc);
+    
+    // 32 位常用寄存器是 R0-R7
+    LOGI("[💎] R0: 0x%lx, R1: 0x%lx, R2: 0x%lx, R3: 0x%lx", 
+         ctx->uc_mcontext.arm_r0, ctx->uc_mcontext.arm_r1, 
+         ctx->uc_mcontext.arm_r2, ctx->uc_mcontext.arm_r3);
+#endif
 
-    // 必须恢复读取权限，否则 CPU 会卡死在这一条指令上
+    // 必须恢复读取权限
     mprotect((void*)(global_sbox_addr & ~0xFFF), 4096, PROT_READ);
-    LOGI("[✅] 权限已临时恢复，请对比 Wireshark 记录分析寄存器。");
+    LOGI("[✅] 权限已临时恢复。");
     LOGI("==================================================");
 }
 
