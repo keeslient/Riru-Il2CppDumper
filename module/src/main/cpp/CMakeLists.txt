@@ -34,16 +34,18 @@ set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${LINKER_FLAGS}")
 set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} ${LINKER_FLAGS}")
 
 # ==============================================================================
-# 3. 【关键修改】改为下载 ZIP 包 (避开 Git 权限报错)
+# 3. 【绝对稳妥】下载官方源码 + 自动修补汇编错误
 # ==============================================================================
 include(FetchContent)
 
-message(STATUS "Downloading Dobby Source (NDK25+ compatible)...")
+message(STATUS "Downloading Official Dobby & Patching for NDK25...")
 
-# 使用 ZIP 下载代替 git clone，解决 GitHub Actions 下的 Username 报错问题
+# 1. 下载官方 master 分支 (100% 存在)
+# 2. 使用 PATCH_COMMAND 自动修改 asm 文件，移除 NDK25 不支持的 @PAGE 写法
 FetchContent_Declare(
   dobby
-  URL https://github.com/Xposed-Modules-Repo/Dobby/archive/refs/heads/master.zip
+  URL https://github.com/jmpews/Dobby/archive/refs/heads/master.zip
+  PATCH_COMMAND sed -i "s/@PAGE//g" ${CMAKE_CURRENT_BINARY_DIR}/_deps/dobby-src/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm
 )
 # 解压并配置
 FetchContent_MakeAvailable(dobby)
@@ -72,7 +74,7 @@ add_library(${MODULE_NAME} SHARED
 # ==============================================================================
 target_link_libraries(${MODULE_NAME} 
         log 
-        dobby # 链接 Dobby
+        dobby 
 )
 
 # ==============================================================================
