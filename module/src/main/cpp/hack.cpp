@@ -28,48 +28,29 @@
 #include <unistd.h> // for sleep
 
 void hack_start(const char *game_data_dir) {
-    __android_log_print(ANDROID_LOG_INFO, "Perfare", ">>> HACK START: Monitoring Memory Maps... <<<");
+    LOGI(">>> HACK START <<<");
 
-    // 无限循环监控，直到找到目标或者你手动关闭游戏
-    int retry_count = 0;
-    while (true) {
-        FILE *fp = fopen("/proc/self/maps", "r");
-        if (fp == nullptr) {
-            sleep(1);
-            continue;
-        }
+    // 1. 既然安装包里就是这个名字，直接打开它！
+    // 只要这一步拿到 handle，所有的 Hook 和 Dump 就都正常了
+    void *handle = xdl_open("libfvctyud.so", 0);
 
-        bool found_something_new = false;
-        char line[2048]; // 加大缓冲区，防止行太长截断
+    if (handle) {
+        LOGI(">>> 终于找到了！Handle: %p <<<", handle);
         
-        while (fgets(line, sizeof(line), fp)) {
-            // 筛选条件：
-            // 1. 必须是可执行段 (r-xp)
-            // 2. 路径在 /data/app (安装包内) 或者 /data/user (解压的数据)
-            if (strstr(line, "r-xp") && (strstr(line, "/data/app") || strstr(line, "/data/user") || strstr(line, "liapp"))) {
-                
-                // 过滤掉已知的普通库，减少刷屏 (可根据需要添加)
-                if (strstr(line, "libunity.so") || strstr(line, "libmain.so")) continue;
-
-                // 打印发现的可疑目标！
-                // 重点看：split_config, libliapp.so, 或者名字很乱的so
-                __android_log_print(ANDROID_LOG_INFO, "Perfare", "[Found Module] %s", line);
-                found_something_new = true;
-            }
+        // 2. 告诉 il2cppdumper："这就是你要的基址"
+        il2cpp_api_init(handle);
+        
+        // 3. 开始执行你的业务（Dump 或者 Hook）
+        il2cpp_dump(game_data_dir); 
+    } else {
+        LOGI(">>> 还是打不开 libfvctyud.so，见鬼了 <<<");
+        
+        // 保底试一下原来的
+        void *fallback = xdl_open("libil2cpp.so", 0);
+        if(fallback) {
+             il2cpp_api_init(fallback);
+             il2cpp_dump(game_data_dir);
         }
-        fclose(fp);
-
-        if (found_something_new) {
-            __android_log_print(ANDROID_LOG_INFO, "Perfare", "----------------------------------------");
-        }
-
-        // 每次扫完，打印个心跳，证明还在活捉
-        if (retry_count % 5 == 0) { 
-             __android_log_print(ANDROID_LOG_INFO, "Perfare", ">>> Scanner Still Alive... (Count: %d) <<<", retry_count);
-        }
-
-        retry_count++;
-        sleep(3); // 每3秒扫一次，给游戏加载的时间
     }
 }
 // -------------------------------------------------------------
