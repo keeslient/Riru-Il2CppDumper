@@ -15,9 +15,9 @@
 #include <android/log.h>
 #include <cstdlib>
 #include <string>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
+#include <signal.h>
+#include <ucontext.h>
+#include <vector>
 
 #ifdef LOG_TAG
 #undef LOG_TAG
@@ -25,84 +25,165 @@
 #define LOG_TAG "IMO_NINJA"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
-// --- 1. 内存嗅探函数 ---
+// 全局变量
+static uintptr_t global_so_base = 0;
+static uintptr_t real_sbox_addr = 0; // 动态搜索到的真 S 盒
+
+// 内存嗅探辅助
 void safe_hex_dump(const char* label, uintptr_t addr, size_t len) {
-    if (addr < 0x10000000 || addr > 0x7fffffffff) return; 
-    size_t actual_len = len > 64 ? 64 : len;
+    if (addr < 0x10000000 || addr > 0x7fffffffff) return;
     unsigned char buf[64];
-    // 简单尝试读取，如果崩溃说明地址不可读
-    if (memcpy(buf, (void*)addr, actual_len)) {
-        char hex_out[256] = {0};
-        for(size_t i = 0; i < actual_len; i++) {
-            sprintf(hex_out + strlen(hex_out), "%02X ", buf[i]);
-        }
-        LOGI("[📦] %s | 长度: %zu | 内容: %s", label, len, hex_out);
+    // 尝试读取，如果地址非法可能会崩溃，所以仅在 trap 中使用较安全
+    memcpy(buf, (void*)addr, len > 32 ? 32 : len);
+    char hex_out[128] = {0};
+    for(size_t i = 0; i < (len > 32 ? 32 : len); i++) {
+        sprintf(hex_out + strlen(hex_out), "%02X ", buf[i]);
+    }
+    LOGI("[💎] %s (地址: %p) 内容: %s", label, (void*)addr, hex_out);
+}
+
+// --- 1. 信号处理函数 ---
+void sbox_trap_handler(int sig, siginfo_t *info, void *context) {
+    auto* ctx = (ucontext_t*)context;
+    
+    // 只有撞到我们锁定的那个真 S 盒才触发
+    if ((uintptr_t)info->si_addr == real_sbox_addr) {
+        LOGI("================ [🚨 抓到活的加密现场] ================");
+        
+#if defined(__aarch64__)
+        uintptr_t pc = ctx->uc_mcontext.pc;
+        uintptr_t lr = ctx->uc_mcontext.regs[30];
+        LOGI("[🎯] PC: %p, LR: %p (追踪此地址!)", (void*)pc, (void*)lr);
+        
+        // 打印 X0-X3，明文大概率在这里
+        safe_hex_dump("寄存器 X0", (uintptr_t)ctx->uc_mcontext.regs[0], 32);
+        safe_hex_dump("寄存器 X1", (uintptr_t)ctx->uc_mcontext.regs[1], 32);
+        safe_hex_dump("寄存器 X2", (uintptr_t)ctx->uc_mcontext.regs[2], 32);
+#elif defined(__arm__)
+        uintptr_t pc = ctx->uc_mcontext.arm_pc;
+        uintptr_t lr = ctx->uc_mcontext.arm_lr;
+        LOGI("[🎯] PC: %p, LR: %p", (void*)pc, (void*)lr);
+#endif
+
+        // 临时恢复权限
+        mprotect((void*)(real_sbox_addr & ~0xFFF), 4096, PROT_READ);
+
+        // 异步重置陷阱，持续监控
+        std::thread([]() {
+            usleep(20000); // 20ms 后重新布防
+            if (real_sbox_addr != 0) {
+                mprotect((void*)(real_sbox_addr & ~0xFFF), 4096, PROT_NONE);
+            }
+        }).detach();
+
+        LOGI("==================================================");
     }
 }
 
-// --- 2. 网络拦截逻辑 ---
-// 注意：由于没有 Hook 库，我们暂时通过打印日志来记录，
-// 核心逻辑在 hack_start 的 LR 追踪。
-uintptr_t get_module_base(const char* name) {
+// --- 2. 核心：全内存搜索 S 盒特征 ---
+// LIAPP 可能会在 Heap 动态生成 S 盒，静态地址往往是诱饵
+void scan_and_trap_real_sbox() {
+    LOGI("[📡] 启动全内存 S-Box 猎杀...");
+    
     FILE* fp = fopen("/proc/self/maps", "r");
-    if (!fp) return 0;
+    if (!fp) return;
+    
     char line[1024];
-    uintptr_t start = 0;
+    // AES S-Box 前 4 字节固定特征
+    uint32_t sbox_sig = 0x7B777C63; // 63 7C 77 7B (小端序)
+    
     while (fgets(line, sizeof(line), fp)) {
-        if (strstr(line, name)) {
-            start = (uintptr_t)strtoull(line, nullptr, 16);
-            break;
+        // 只扫描可读写 (rw-) 的段，这通常是 Heap 或 Stack，也是动态 S 盒藏身之处
+        if (strstr(line, "rw-p")) {
+            uintptr_t start, end;
+            if (sscanf(line, "%lx-%lx", &start, &end) == 2) {
+                // 过滤掉太小的段或系统段，提高效率
+                if (end - start < 4096) continue;
+                
+                // 暴力扫描该段
+                for (uintptr_t addr = start; addr < end - 16; addr += 4) {
+                    // 使用 mincore 或直接 try-catch 会更稳，但这里假设 maps 准确
+                    // 简单检查前4字节
+                    if (*(uint32_t*)addr == sbox_sig) {
+                        // 二次检查：检查第 16 个字节是否为 63 (S[0]=0x63, S[15] is different)
+                        // S-Box: 63 7C 77 7B F2 6B 6F C5 ...
+                        unsigned char* p = (unsigned char*)addr;
+                        if (p[4] == 0xF2 && p[5] == 0x6B) {
+                            LOGI("[🔥] 发现疑似动态 S 盒！地址: %p", (void*)addr);
+                            
+                            // 排除掉那个假的静态 S 盒 (如果你知道它的范围)
+                            // 布下陷阱
+                            real_sbox_addr = addr;
+                            
+                            struct sigaction sa;
+                            memset(&sa, 0, sizeof(sa));
+                            sa.sa_flags = SA_SIGINFO;
+                            sa.sa_sigaction = sbox_trap_handler;
+                            sigaction(SIGSEGV, &sa, NULL);
+                            
+                            if (mprotect((void*)(real_sbox_addr & ~0xFFF), 4096, PROT_NONE) == 0) {
+                                LOGI("[🪤] 成功在动态 S 盒上布雷！等待触发...");
+                                fclose(fp); // 找到一个就收工，避免多重陷阱崩溃
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
     fclose(fp);
-    return start;
+    LOGI("[❌] 内存扫描结束，未找到动态 S 盒。可能使用了硬件 AES 指令。");
 }
 
-// --- 3. 核心启动函数 ---
+// --- 3. 启动入口 ---
 void hack_start(const char *game_data_dir) {
-    LOGI("[📡] 暴力嗅探雷达已启动，开始全内存搜索 Wireshark 特征包...");
-
-    // 获取目标库基址
-    uintptr_t base = 0;
-    while (base == 0) {
-        base = get_module_base("libfvctyud.so");
+    LOGI("[🚀] 动态猎杀版启动...");
+    
+    // 先尝试获取核心库基址 (辅助定位)
+    for (int i = 0; i < 10; i++) {
+        FILE* fp = fopen("/proc/self/maps", "r");
+        if (fp) {
+            char line[1024];
+            while (fgets(line, sizeof(line), fp)) {
+                if (strstr(line, "libfvctyud.so")) { // 你的乱码 SO 名
+                    global_so_base = strtoull(line, nullptr, 16);
+                    LOGI("[ℹ️] 核心库基址: %p", (void*)global_so_base);
+                    break;
+                }
+            }
+            fclose(fp);
+        }
+        if (global_so_base) break;
         sleep(1);
     }
 
-    // 重点：我们不再等它触发，我们主动监控 libfvctyud.so 的数据段
-    // 假设它的数据段在基址往后 0x100000 左右
-    uintptr_t data_section = base + 0x100000; 
+    // 无论找没找到 SO，都直接启动全内存搜索
+    // 因为动态 S 盒可能在堆里，不在 SO 段里
+    std::thread(scan_and_trap_real_sbox).detach();
 
-    while (true) {
-        // 扫描内存中是否出现了 Wireshark 抓到的特征头：08 00 00 00
-        for (uintptr_t addr = data_section; addr < data_section + 0x50000; addr += 8) {
-            unsigned char* p = (unsigned char*)addr;
-            if (p[0] == 0x08 && p[1] == 0x00 && p[2] == 0x00 && p[3] == 0x00) {
-                LOGI("[🔥] 雷达发现疑似明文包！地址: %p", (void*)addr);
-                safe_hex_dump("捕获内容", addr, 64);
-                // 抓到后停一下，防止日志刷屏
-                sleep(2);
-            }
-        }
-        usleep(500000); // 每 0.5 秒扫一次
+    // 保留 il2cpp dump 逻辑
+    void *handle = xdl_open("libil2cpp.so", 0);
+    if (handle) {
+        il2cpp_api_init(handle);
+        il2cpp_dump(game_data_dir);
     }
 }
-// --- 4. Zygisk 调用的关键出口函数 ---
-// 修正：必须使用 extern "C" 或者确保与 hack.h 声明一致
+
+// --- 4. 修复链接错误的 Zygisk 接口 ---
 void hack_prepare(const char *game_data_dir, void *data, size_t length) {
-    LOGI("[🔗] Zygisk 准备调用 hack_start...");
-    // 这里的 data 和 length 是原本 NativeBridge 使用的，在常规模式下可以忽略
+    LOGI("[🔗] Zygisk 调用 hack_prepare...");
     std::string path = game_data_dir ? game_data_dir : "";
     std::thread([path]() {
+        // 延迟一点启动，等游戏解密出真正的 S 盒
+        sleep(5); 
         hack_start(path.c_str());
     }).detach();
 }
 
-// --- 5. 兼容普通 JNI 加载入口 ---
 #if defined(__arm__) || defined(__aarch64__)
 extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
-    const char* path = (const char*)reserved;
-    hack_prepare(path, nullptr, 0);
+    hack_prepare((const char*)reserved, nullptr, 0);
     return JNI_VERSION_1_6;
 }
 #endif
