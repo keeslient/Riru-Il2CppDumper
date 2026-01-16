@@ -107,6 +107,10 @@ void dump_and_trap(const char* so_name, const char* game_data_dir) {
 
     mprotect((void*)(global_sbox_addr & ~0xFFF), 4096, PROT_NONE);
     LOGI("[🪤] AES 陷阱已布在 %s 偏移 0x%lx 处", so_name, (long)SBOX_OFFSET);
+    // 故意读一下 S 盒，看看能不能触发我们的 handler
+// 如果 Logcat 立即弹出了 [🚨 捕获加密动作]，说明我们的陷阱是通的
+volatile char test = *(char*)global_sbox_addr; 
+LOGI("[🧪] 手动触发测试完成，读取到的值为: %02x", test);
 }
 
 // --- 以下为官方原版逻辑，保持不变 ---
