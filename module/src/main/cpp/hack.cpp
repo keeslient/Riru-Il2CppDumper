@@ -13,7 +13,8 @@
 #include <vector>
 #include <iomanip>
 #include <sstream>
-
+#include <unwind.h>
+#include <dlfcn.h>
 #define LOG_TAG "Perfare"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
@@ -25,7 +26,71 @@ std::string hexStr(unsigned char *data, int len) {
         ss << std::setw(2) << std::setfill('0') << (int)data[i] << " ";
     return ss.str();
 }
+// =============================================================
+// 堆栈回溯结构体
+// =============================================================
+struct BacktraceState {
+    void** current;
+    void** end;
+};
 
+// 回调函数：由 _Unwind_Backtrace 每一层调用一次
+_Unwind_Reason_Code UnwindCallback(struct _Unwind_Context* context, void* arg) {
+    BacktraceState* state = static_cast<BacktraceState*>(arg);
+    uintptr_t pc = _Unwind_GetIP(context);
+    if (pc) {
+        if (state->current == state->end) {
+            return _URC_END_OF_STACK;
+        } else {
+            *state->current++ = reinterpret_cast<void*>(pc);
+        }
+    }
+    return _URC_NO_REASON;
+}
+
+// =============================================================
+// 【核心功能】打印当前调用栈
+// =============================================================
+void PrintStackTrace() {
+    const size_t max = 30; // 最多打印 30 层
+    void* buffer[max];
+
+    BacktraceState state = {buffer, buffer + max};
+    _Unwind_Backtrace(UnwindCallback, &state);
+
+    size_t count = state.current - buffer;
+
+    // 获取 libil2cpp.so 的基址，用来计算偏移
+    // 注意：这里复用了你之前写的 FindRealIl2CppBase 逻辑
+    // 如果那个函数没存全局变量，建议弄个全局变量 g_il2cpp_base
+    // 这里为了演示，我假设你有一个全局变量 g_il2cpp_base
+    // 如果没有，你需要先获取一下，或者直接用 dl_iterate_phdr 找
+    // 简单起见，我们打印绝对地址，你去 IDA 里减去基址也行
+    
+    LOGI("========== CALL STACK START ==========");
+    
+    for (size_t i = 0; i < count; ++i) {
+        uintptr_t addr = (uintptr_t)buffer[i];
+        
+        // 尝试获取符号信息 (如果有的话，release版通常没有)
+        Dl_info info;
+        if (dladdr((void*)addr, &info) && info.dli_fname) {
+            // 计算相对偏移： 绝对地址 - 模块基址
+            uintptr_t offset = addr - (uintptr_t)info.dli_fbase;
+            
+            // 只打印 libil2cpp.so 里的调用，过滤掉系统的
+            if (strstr(info.dli_fname, "libil2cpp.so")) {
+                LOGI("#%02zu PC: %p  (libil2cpp.so + 0x%lx)", i, (void*)addr, offset);
+            } else {
+                // 其他库（比如系统库或 art）
+                // LOGI("#%02zu PC: %p  (%s)", i, (void*)addr, info.dli_fname);
+            }
+        } else {
+            LOGI("#%02zu PC: %p  (Unknown)", i, (void*)addr);
+        }
+    }
+    LOGI("=========== CALL STACK END ===========");
+}
 // 定义原函数指针
 void (*old_PacketEncode)(void* instance, void* packet, bool flag);
 
@@ -49,6 +114,15 @@ void new_PacketEncode(void* instance, void* packet, bool flag) {
                 LOGI(">>> [抓包] 长度: %d | Data: %s", data_len, hexStr(raw_data, (data_len > 64 ? 64 : data_len)).c_str());
             }
         }
+        static bool printed = false;
+    if (!printed) {
+        LOGI(">>> 捕获到函数调用，开始回溯堆栈... <<<");
+        PrintStackTrace();
+        printed = true; // 只打一次，打完收工
+    }
+
+    // 调用原函数
+    if(old_PacketEncode) old_PacketEncode(instance, packet, flag);
     }
 
     // 调用原函数，保证游戏逻辑正常
