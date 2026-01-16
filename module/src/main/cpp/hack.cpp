@@ -27,7 +27,7 @@
 
 // --- 全局变量 ---
 static uintptr_t real_sbox_addr = 0; 
-static char target_so_name[256] = {0}; // 自动识别到的乱码 SO 名字
+static char target_so_name[256] = {0}; 
 
 // --- 1. 内存嗅探 ---
 void safe_hex_dump(const char* label, uintptr_t addr, size_t len) {
@@ -68,122 +68,122 @@ void sbox_trap_handler(int sig, siginfo_t *info, void *context) {
         LOGI("[🎯] PC: %p, LR: %p", (void*)pc, (void*)lr);
 #endif
 
+        // 恢复权限
         mprotect((void*)(real_sbox_addr & ~0xFFF), 4096, PROT_READ);
-        real_sbox_addr = 0; // 销毁陷阱，防止卡顿
-        LOGI("[✅] 关键数据已提取，任务完成。");
+        real_sbox_addr = 0; // 销毁全局变量，停止监控
+        LOGI("[✅] 陷阱已触发并解除，不再拦截。");
         LOGI("==================================================");
     }
 }
 
-// --- 3. 核心：S-Box 猎杀 (严格白名单版) ---
+// --- 3. 核心：死循环扫描 (直到找到为止) ---
 void scan_and_trap_real_sbox() {
-    LOGI("[📡] 启动精准狙击模式 (过滤系统与Java层)...");
+    LOGI("[📡] 启动持续监控模式 (每3秒扫描一次)...");
     
-    // 延时 8 秒，确保游戏 Native 层加载完毕
-    sleep(8);
-
-    FILE* fp = fopen("/proc/self/maps", "r");
-    if (!fp) return;
-    
-    char line[1024];
     uint32_t sbox_sig = 0x7B777C63; 
     
-    while (fgets(line, sizeof(line), fp)) {
-        // 【1】黑名单：绝对过滤掉所有系统库和 Java 虚拟机相关
-        if (strstr(line, "/system/") || strstr(line, "/apex/") || strstr(line, "/vendor/") ||
-            strstr(line, "dalvik")   || strstr(line, "art")    || strstr(line, "base.apk") || 
-            strstr(line, "cache")    || strstr(line, "fonts")) {
+    // 【修改点】改为死循环，直到找到目标才退出
+    while (real_sbox_addr == 0) {
+        
+        FILE* fp = fopen("/proc/self/maps", "r");
+        if (!fp) {
+            sleep(1);
             continue;
         }
-
-        // 【2】白名单：只扫描两类目标
-        // A. 那个乱码 SO (如果已经识别到了名字)
-        // B. 匿名堆内存 [anon:libc_malloc] (LIAPP 动态解密区)
-        bool is_target = false;
         
-        if (strlen(target_so_name) > 0 && strstr(line, target_so_name)) {
-            is_target = true;
-        }
-        else if (strstr(line, "[anon:libc_malloc]") || strstr(line, "[heap]")) {
-            is_target = true;
-        }
-        // 如果名字是乱码的 SO (通常在 /data/app 下且名字奇怪)，也算目标
-        else if (strstr(line, "/data/app") && strstr(line, ".so") && 
-                 !strstr(line, "libmain.so") && !strstr(line, "libunity.so")) {
-            is_target = true;
-        }
+        char line[1024];
+        while (fgets(line, sizeof(line), fp)) {
+            // 严格过滤系统库
+            if (strstr(line, "/system/") || strstr(line, "/apex/") || strstr(line, "/vendor/") ||
+                strstr(line, "dalvik")   || strstr(line, "art")    || strstr(line, "base.apk") || 
+                strstr(line, "cache")    || strstr(line, "fonts")) {
+                continue;
+            }
 
-        if (!is_target) continue;
+            bool is_target = false;
+            // 只看乱码 SO 或 堆内存
+            if (strlen(target_so_name) > 0 && strstr(line, target_so_name)) is_target = true;
+            else if (strstr(line, "[anon:libc_malloc]") || strstr(line, "[heap]")) is_target = true;
+            else if (strstr(line, "/data/app") && strstr(line, ".so") && 
+                     !strstr(line, "libmain.so") && !strstr(line, "libunity.so")) is_target = true;
 
-        // 开始扫描
-        if (strstr(line, "rw-p")) {
-            unsigned long tmp_start, tmp_end;
-            if (sscanf(line, "%lx-%lx", &tmp_start, &tmp_end) == 2) {
-                uintptr_t start = (uintptr_t)tmp_start;
-                uintptr_t end = (uintptr_t)tmp_end;
-                if (end - start < 4096) continue;
+            if (!is_target) continue;
 
-                for (uintptr_t addr = start; addr < end - 16; addr += 4) {
-                    if (*(uint32_t*)addr == sbox_sig) {
-                        unsigned char* p = (unsigned char*)addr;
-                        if (p[4] == 0xF2 && p[5] == 0x6B) {
-                            LOGI("[🔥] 锁定目标 S 盒！地址: %p", (void*)addr);
-                            LOGI("[ℹ️] 来源确认: %s", line); // 必须是 libc_malloc 或 乱码SO 才行
-                            
-                            real_sbox_addr = addr;
-                            struct sigaction sa;
-                            memset(&sa, 0, sizeof(sa));
-                            sa.sa_flags = SA_SIGINFO;
-                            sa.sa_sigaction = sbox_trap_handler;
-                            sigaction(SIGSEGV, &sa, NULL);
-                            
-                            if (mprotect((void*)(real_sbox_addr & ~0xFFF), 4096, PROT_NONE) == 0) {
-                                LOGI("[🪤] 狙击陷阱已就位！");
-                                fclose(fp);
-                                return;
+            if (strstr(line, "rw-p")) {
+                unsigned long tmp_start, tmp_end;
+                if (sscanf(line, "%lx-%lx", &tmp_start, &tmp_end) == 2) {
+                    uintptr_t start = (uintptr_t)tmp_start;
+                    uintptr_t end = (uintptr_t)tmp_end;
+                    if (end - start < 4096) continue;
+
+                    for (uintptr_t addr = start; addr < end - 16; addr += 4) {
+                        if (*(uint32_t*)addr == sbox_sig) {
+                            unsigned char* p = (unsigned char*)addr;
+                            if (p[4] == 0xF2 && p[5] == 0x6B) {
+                                LOGI("[🔥] 终于等到你！地址: %p", (void*)addr);
+                                LOGI("[ℹ️] 来源: %s", line);
+                                
+                                real_sbox_addr = addr;
+                                struct sigaction sa;
+                                memset(&sa, 0, sizeof(sa));
+                                sa.sa_flags = SA_SIGINFO;
+                                sa.sa_sigaction = sbox_trap_handler;
+                                sigaction(SIGSEGV, &sa, NULL);
+                                
+                                if (mprotect((void*)(real_sbox_addr & ~0xFFF), 4096, PROT_NONE) == 0) {
+                                    LOGI("[🪤] 陷阱布设成功！等待游戏触发...");
+                                    fclose(fp);
+                                    return; // 找到后退出函数，不再扫描
+                                }
                             }
                         }
                     }
                 }
             }
         }
+        fclose(fp);
+        
+        // 没找到？休息3秒继续找，直到地老天荒
+        if (real_sbox_addr == 0) {
+            // LOGI("[💤] 本轮未发现，3秒后重试..."); // 调试时可开启
+            sleep(3);
+        }
     }
-    fclose(fp);
-    LOGI("[⚠️] 扫描完成，未发现符合严格过滤条件的目标。");
 }
 
 // --- 4. 启动入口 ---
 void hack_start(const char *game_data_dir) {
-    LOGI("[🚀] LIAPP 猎杀器启动...");
+    LOGI("[🚀] 猎杀者就绪...");
     
-    // 自动识别乱码 SO 名字，用于辅助过滤
-    for (int i = 0; i < 20; i++) {
-        FILE* fp = fopen("/proc/self/maps", "r");
-        if (fp) {
-            char line[1024];
-            while (fgets(line, sizeof(line), fp)) {
-                if (strstr(line, ".so") && strstr(line, "/data/app") && 
-                    !strstr(line, "libmain.so") && !strstr(line, "libunity.so") && 
-                    !strstr(line, "libil2cpp.so")) {
-                    
-                    char* so_path = strchr(line, '/');
-                    char* so_name = strrchr(so_path, '/');
-                    if (so_name) {
-                        so_name++;
-                        so_name[strcspn(so_name, "\n")] = 0;
-                        strncpy(target_so_name, so_name, 255);
-                        LOGI("[ℹ️] 自动识别目标 SO: %s", target_so_name);
-                        break;
+    // 持续尝试识别乱码 SO 名字
+    std::thread([]() {
+        while (strlen(target_so_name) == 0) {
+            FILE* fp = fopen("/proc/self/maps", "r");
+            if (fp) {
+                char line[1024];
+                while (fgets(line, sizeof(line), fp)) {
+                    if (strstr(line, ".so") && strstr(line, "/data/app") && 
+                        !strstr(line, "libmain.so") && !strstr(line, "libunity.so") && 
+                        !strstr(line, "libil2cpp.so")) {
+                        
+                        char* so_path = strchr(line, '/');
+                        char* so_name = strrchr(so_path, '/');
+                        if (so_name) {
+                            so_name++;
+                            so_name[strcspn(so_name, "\n")] = 0;
+                            strncpy(target_so_name, so_name, 255);
+                            LOGI("[ℹ️] 目标锁定: %s", target_so_name);
+                            break;
+                        }
                     }
                 }
+                fclose(fp);
             }
-            fclose(fp);
+            if (strlen(target_so_name) == 0) sleep(1);
         }
-        if (strlen(target_so_name) > 0) break;
-        usleep(500000);
-    }
+    }).detach();
 
-    // 启动猎杀线程
+    // 启动死循环扫描线程
     std::thread(scan_and_trap_real_sbox).detach();
 
     // il2cpp dump
@@ -196,7 +196,7 @@ void hack_start(const char *game_data_dir) {
 
 // --- 5. 接口 ---
 void hack_prepare(const char *game_data_dir, void *data, size_t length) {
-    LOGI("[🔗] Zygisk 注入成功");
+    LOGI("[🔗] Zygisk 注入成功，后台线程已启动");
     std::string path = game_data_dir ? game_data_dir : "";
     std::thread([path]() {
         hack_start(path.c_str());
