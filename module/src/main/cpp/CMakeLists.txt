@@ -34,21 +34,18 @@ set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${LINKER_FLAGS}")
 set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} ${LINKER_FLAGS}")
 
 # ==============================================================================
-# 3. 【关键修改】使用适配 NDK 25 的 Dobby 分支
+# 3. 【关键修改】改为下载 ZIP 包 (避开 Git 权限报错)
 # ==============================================================================
 include(FetchContent)
 
-message(STATUS "Configuring Dobby (Fork for NDK25+)...")
+message(STATUS "Downloading Dobby Source (NDK25+ compatible)...")
 
-# 官方 jmpews/Dobby 已不再维护，无法在 NDK25 编译。
-# 这里改用 Xposed-Modules-Repo 维护的分支，修复了 ARM64 汇编报错。
+# 使用 ZIP 下载代替 git clone，解决 GitHub Actions 下的 Username 报错问题
 FetchContent_Declare(
   dobby
-  GIT_REPOSITORY https://github.com/Xposed-Modules-Repo/Dobby.git
-  GIT_TAG        master
-  GIT_SHALLOW    TRUE
+  URL https://github.com/Xposed-Modules-Repo/Dobby/archive/refs/heads/master.zip
 )
-# 下载并使 Dobby 可用
+# 解压并配置
 FetchContent_MakeAvailable(dobby)
 
 # ==============================================================================
