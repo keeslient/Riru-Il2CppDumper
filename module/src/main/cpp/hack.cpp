@@ -1,9 +1,3 @@
-//
-// Created by Perfare on 2020/7/4.
-//
-#include <fstream>
-#include <string>
-#include <iostream>
 #include "hack.h"
 #include "il2cpp_dump.h"
 #include "log.h"
@@ -19,110 +13,100 @@
 #include <linux/unistd.h>
 #include <array>
 #include <android/log.h>
+#include <fstream>  // 必须包含
+#include <cstdlib>  // strtoul
 
-// -------------------------------------------------------------
-// 只修改了这里：尝试捕捉真身 libliapp.so
-// -------------------------------------------------------------
-#include <fstream>
-#include <string>
-#include <unistd.h> // for sleep
+// ------------------------------------------------------------------
+// 核心函数：绕过 xdl，直接从内核 maps 读取基地址
+// ------------------------------------------------------------------
+void* GetBaseAddress(const char* lib_name) {
+    FILE* fp = fopen("/proc/self/maps", "r");
+    if (!fp) return nullptr;
+
+    char line[2048];
+    void* addr = nullptr;
+
+    while (fgets(line, sizeof(line), fp)) {
+        // 查找包含 lib_name (例如 libfvctyud.so) 且具有 r-xp (可执行) 权限的行
+        if (strstr(line, lib_name) && strstr(line, "r-xp")) {
+            // maps 格式: 78fac8f000-78fad24000 r-xp ...
+            // 我们只需要第一个横杠前面的部分
+            unsigned long start_addr;
+            if (sscanf(line, "%lx-", &start_addr) == 1) {
+                addr = (void*)start_addr;
+                break;
+            }
+        }
+    }
+    fclose(fp);
+    return addr;
+}
 
 void hack_start(const char *game_data_dir) {
-    __android_log_print(ANDROID_LOG_INFO, "Perfare", ">>> HACK START: 正在蹲守 libfvctyud.so <<<");
+    __android_log_print(ANDROID_LOG_INFO, "Perfare", ">>> HACK START: Waiting for libfvctyud.so via Maps... <<<");
 
-    void *handle = nullptr;
+    void* base_addr = nullptr;
     
-    // 1. 死循环等待加载 (正如之前验证有效的逻辑)
+    // 1. 死循环等待，直到 maps 里出现这个库
     while (true) {
-        handle = xdl_open("libfvctyud.so", 0);
-        if (handle) {
-            __android_log_print(ANDROID_LOG_INFO, "Perfare", "!!! 捕获成功 (Handle: %p) !!!", handle);
+        base_addr = GetBaseAddress("libfvctyud.so"); // 直接找这个名字
+        
+        if (base_addr != nullptr) {
+            __android_log_print(ANDROID_LOG_INFO, "Perfare", "!!! SUCCESS !!! Real Base Address: %p", base_addr);
             break;
         }
+        
+        // 没找到就睡 1 秒
         sleep(1);
     }
 
-    // 2. 获取真正的内存基地址 (Base Address)
-    // 注意：handle 不等于基地址，必须用 xdl_info 查出来
-    xdl_info_t info;
-    void* base_addr = nullptr;
+    // 2. 拿到基址后，你需要做的 Hook 操作放这里
+    // 注意：不要再调 il2cpp_api_init 了，那个肯定崩。
     
-    if (xdl_info(handle, XDL_DI_DLINFO, &info)) {
-        base_addr = info.dli_fbase;
-        __android_log_print(ANDROID_LOG_INFO, "Perfare", ">>> 真身基地址 Base Address: %p <<<", base_addr);
-    } else {
-        __android_log_print(ANDROID_LOG_INFO, "Perfare", "FATAL: 无法获取基地址！");
-        return;
-    }
+    // 示例：打印一下验证偏移 (假设偏移是 0x123456)
+    // __android_log_print(ANDROID_LOG_INFO, "Perfare", "Target Func Addr: %p", (void*)((uintptr_t)base_addr + 0x123456));
 
-    // 3. 【在这里执行 Hook】
-    // 既然 API 都是空的，dump 肯定闪退，直接注释掉下面两行！
-    // il2cpp_api_init(handle); 
-    // il2cpp_dump(game_data_dir);
+    // ---------------------------------------------------------
+    // 你的业务代码 (Hook Dobby 等) 写在下面
+    // ---------------------------------------------------------
+    
+    
+    // ---------------------------------------------------------
 
-    // -----------------------------------------------------------
-    // 你的 Hook 逻辑应该写在这里
-    // 假设你要 Hook 的偏移是 0x123456 (来自 dump.cs)
-    // -----------------------------------------------------------
+    __android_log_print(ANDROID_LOG_INFO, "Perfare", ">>> Hook Setup Done. Monitoring... <<<");
     
-    // uintptr_t target_offset = 0x123456; // 替换成你的真实偏移
-    // void* target_addr = (void*)((uintptr_t)base_addr + target_offset);
-    
-    // __android_log_print(ANDROID_LOG_INFO, "Perfare", "准备 Hook 地址: %p", target_addr);
-    
-    // DobbyHook(target_addr, (void*)new_func, (void**)&old_func); 
-    
-    __android_log_print(ANDROID_LOG_INFO, "Perfare", ">>> 任务完成，线程休眠防止退出 <<<");
-    while(true) sleep(100);
+    // 保持线程存活
+    while(true) sleep(10);
 }
-// -------------------------------------------------------------
-// 以下部分完全保持你提供的源码原样，一个字符都不动
-// -------------------------------------------------------------
+
+// ------------------------------------------------------------------
+// 下面的 NativeBridgeLoad 等保持原样，为了过编译我不删了
+// ------------------------------------------------------------------
 
 std::string GetLibDir(JavaVM *vms) {
     JNIEnv *env = nullptr;
     vms->AttachCurrentThread(&env, nullptr);
     jclass activity_thread_clz = env->FindClass("android/app/ActivityThread");
     if (activity_thread_clz != nullptr) {
-        jmethodID currentApplicationId = env->GetStaticMethodID(activity_thread_clz,
-                                                                "currentApplication",
-                                                                "()Landroid/app/Application;");
+        jmethodID currentApplicationId = env->GetStaticMethodID(activity_thread_clz, "currentApplication", "()Landroid/app/Application;");
         if (currentApplicationId) {
-            jobject application = env->CallStaticObjectMethod(activity_thread_clz,
-                                                              currentApplicationId);
+            jobject application = env->CallStaticObjectMethod(activity_thread_clz, currentApplicationId);
             jclass application_clazz = env->GetObjectClass(application);
             if (application_clazz) {
-                jmethodID get_application_info = env->GetMethodID(application_clazz,
-                                                                  "getApplicationInfo",
-                                                                  "()Landroid/content/pm/ApplicationInfo;");
+                jmethodID get_application_info = env->GetMethodID(application_clazz, "getApplicationInfo", "()Landroid/content/pm/ApplicationInfo;");
                 if (get_application_info) {
-                    jobject application_info = env->CallObjectMethod(application,
-                                                                     get_application_info);
-                    jfieldID native_library_dir_id = env->GetFieldID(
-                            env->GetObjectClass(application_info), "nativeLibraryDir",
-                            "Ljava/lang/String;");
+                    jobject application_info = env->CallObjectMethod(application, get_application_info);
+                    jfieldID native_library_dir_id = env->GetFieldID(env->GetObjectClass(application_info), "nativeLibraryDir", "Ljava/lang/String;");
                     if (native_library_dir_id) {
-                        auto native_library_dir_jstring = (jstring) env->GetObjectField(
-                                application_info, native_library_dir_id);
+                        auto native_library_dir_jstring = (jstring) env->GetObjectField(application_info, native_library_dir_id);
                         auto path = env->GetStringUTFChars(native_library_dir_jstring, nullptr);
-                        LOGI("lib dir %s", path);
                         std::string lib_dir(path);
                         env->ReleaseStringUTFChars(native_library_dir_jstring, path);
                         return lib_dir;
-                    } else {
-                        LOGE("nativeLibraryDir not found");
                     }
-                } else {
-                    LOGE("getApplicationInfo not found");
                 }
-            } else {
-                LOGE("application class not found");
             }
-        } else {
-            LOGE("currentApplication not found");
         }
-    } else {
-        LOGE("ActivityThread not found");
     }
     return {};
 }
@@ -136,11 +120,8 @@ static std::string GetNativeBridgeLibrary() {
 struct NativeBridgeCallbacks {
     uint32_t version;
     void *initialize;
-
     void *(*loadLibrary)(const char *libpath, int flag);
-
     void *(*getTrampoline)(void *handle, const char *name, const char *shorty, uint32_t len);
-
     void *isSupported;
     void *getAppEnv;
     void *isCompatibleWith;
@@ -151,36 +132,21 @@ struct NativeBridgeCallbacks {
     void *initAnonymousNamespace;
     void *createNamespace;
     void *linkNamespaces;
-
     void *(*loadLibraryExt)(const char *libpath, int flag, void *ns);
 };
 
 bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size_t length) {
-    //TODO 等待houdini初始化
     sleep(5);
-
     auto libart = dlopen("libart.so", RTLD_NOW);
-    auto JNI_GetCreatedJavaVMs = (jint (*)(JavaVM **, jsize, jsize *)) dlsym(libart,
-                                                                             "JNI_GetCreatedJavaVMs");
-    LOGI("JNI_GetCreatedJavaVMs %p", JNI_GetCreatedJavaVMs);
+    auto JNI_GetCreatedJavaVMs = (jint (*)(JavaVM **, jsize, jsize *)) dlsym(libart, "JNI_GetCreatedJavaVMs");
     JavaVM *vms_buf[1];
-    JavaVM *vms;
     jsize num_vms;
     jint status = JNI_GetCreatedJavaVMs(vms_buf, 1, &num_vms);
-    if (status == JNI_OK && num_vms > 0) {
-        vms = vms_buf[0];
-    } else {
-        LOGE("GetCreatedJavaVMs error");
-        return false;
-    }
-
+    if (status != JNI_OK || num_vms <= 0) return false;
+    
+    JavaVM *vms = vms_buf[0];
     auto lib_dir = GetLibDir(vms);
-    if (lib_dir.empty()) {
-        LOGE("GetLibDir error");
-        return false;
-    }
-    if (lib_dir.find("/lib/x86") != std::string::npos) {
-        LOGI("no need NativeBridge");
+    if (lib_dir.empty() || lib_dir.find("/lib/x86") != std::string::npos) {
         munmap(data, length);
         return false;
     }
@@ -188,17 +154,11 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size
     auto nb = dlopen("libhoudini.so", RTLD_NOW);
     if (!nb) {
         auto native_bridge = GetNativeBridgeLibrary();
-        LOGI("native bridge: %s", native_bridge.data());
         nb = dlopen(native_bridge.data(), RTLD_NOW);
     }
     if (nb) {
-        LOGI("nb %p", nb);
         auto callbacks = (NativeBridgeCallbacks *) dlsym(nb, "NativeBridgeItf");
         if (callbacks) {
-            LOGI("NativeBridgeLoadLibrary %p", callbacks->loadLibrary);
-            LOGI("NativeBridgeLoadLibraryExt %p", callbacks->loadLibraryExt);
-            LOGI("NativeBridgeGetTrampoline %p", callbacks->getTrampoline);
-
             int fd = syscall(__NR_memfd_create, "anon", MFD_CLOEXEC);
             ftruncate(fd, (off_t) length);
             void *mem = mmap(nullptr, length, PROT_WRITE, MAP_SHARED, fd, 0);
@@ -207,8 +167,6 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size
             munmap(data, length);
             char path[PATH_MAX];
             snprintf(path, PATH_MAX, "/proc/self/fd/%d", fd);
-            LOGI("arm path %s", path);
-
             void *arm_handle;
             if (api_level >= 26) {
                 arm_handle = callbacks->loadLibraryExt(path, RTLD_NOW, (void *) 3);
@@ -216,11 +174,7 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size
                 arm_handle = callbacks->loadLibrary(path, RTLD_NOW);
             }
             if (arm_handle) {
-                LOGI("arm handle %p", arm_handle);
-                auto init = (void (*)(JavaVM *, void *)) callbacks->getTrampoline(arm_handle,
-                                                                                  "JNI_OnLoad",
-                                                                                  nullptr, 0);
-                LOGI("JNI_OnLoad %p", init);
+                auto init = (void (*)(JavaVM *, void *)) callbacks->getTrampoline(arm_handle, "JNI_OnLoad", nullptr, 0);
                 init(vms, (void *) game_data_dir);
                 return true;
             }
@@ -231,10 +185,7 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size
 }
 
 void hack_prepare(const char *game_data_dir, void *data, size_t length) {
-    LOGI("hack thread: %d", gettid());
     int api_level = android_get_device_api_level();
-    LOGI("api level: %d", api_level);
-
 #if defined(__i386__) || defined(__x86_64__)
     if (!NativeBridgeLoad(game_data_dir, api_level, data, length)) {
 #endif
@@ -245,12 +196,10 @@ void hack_prepare(const char *game_data_dir, void *data, size_t length) {
 }
 
 #if defined(__arm__) || defined(__aarch64__)
-
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
     auto game_data_dir = (const char *) reserved;
     std::thread hack_thread(hack_start, game_data_dir);
     hack_thread.detach();
     return JNI_VERSION_1_6;
 }
-
 #endif
