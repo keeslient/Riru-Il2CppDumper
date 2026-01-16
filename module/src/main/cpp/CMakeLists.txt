@@ -10,7 +10,7 @@ message("Build type: ${CMAKE_BUILD_TYPE}")
 
 set(CMAKE_CXX_STANDARD 20)
 
-# 基础编译参数
+# Flag 配置
 set(LINKER_FLAGS "-ffixed-x18 -Wl,--hash-style=both")
 set(C_FLAGS "-Werror=format -fdata-sections -ffunction-sections")
 set(CXX_FLAGS "${CXX_FLAGS} -fno-exceptions -fno-rtti")
@@ -28,21 +28,21 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${C_FLAGS} ${CXX_FLAGS}")
 set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${LINKER_FLAGS}")
 set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} ${LINKER_FLAGS}")
 
-# 包含路径 (只有本地的)
 include_directories(
         xdl/include
+        .  # 当前目录，为了能引用 And64InlineHook.hpp
 )
 
 aux_source_directory(xdl xdl-src)
 
-# 编译目标 (移除了 Dobby)
+# 编译目标：加入 And64InlineHook.cpp
 add_library(${MODULE_NAME} SHARED
         main.cpp
         hack.cpp
         il2cpp_dump.cpp
+        And64InlineHook.cpp  # <--- 新增这个
         ${xdl-src})
 
-# 链接库 (只有 log)
 target_link_libraries(${MODULE_NAME} log)
 
 if (NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
