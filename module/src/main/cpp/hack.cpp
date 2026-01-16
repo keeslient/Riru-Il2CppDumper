@@ -18,51 +18,16 @@
 #include <array>
 #include <link.h>
 
-// 【修复】补回缺失的系统头文件
-#include <sys/system_properties.h> // 解决 PROP_VALUE_MAX 报错
-#include <sys/syscall.h>           // 解决 syscall 报错
-#include <linux/unistd.h>          // 解决 __NR_memfd_create 报错
-
-// =============================================================
-// 0. 基础设置与防报错声明
-// =============================================================
+// 补全系统头文件
+#include <sys/system_properties.h>
+#include <sys/syscall.h>
+#include <linux/unistd.h>
 
 #define LOG_TAG "Perfare"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
-// 手动声明 DobbyHook
-extern "C" {
-    int DobbyHook(void *address, void *replace_call, void **origin_call);
-}
-
 // =============================================================
-// 1. 辅助工具：Hex 转字符串
-// =============================================================
-std::string hexStr(unsigned char *data, int len) {
-    std::stringstream ss;
-    ss << std::hex;
-    for (int i = 0; i < len; ++i)
-        ss << std::setw(2) << std::setfill('0') << (int)data[i] << " ";
-    return ss.str();
-}
-
-// =============================================================
-// 2. Hook 函数定义
-// =============================================================
-
-// 原始函数指针
-void (*old_PacketEncode)(void* instance, void* packet, bool flag);
-
-// 我们的新函数
-void new_PacketEncode(void* instance, void* packet, bool flag) {
-    LOGI(">>> [PacketEncode] 触发! Obj: %p, Flag: %d", packet, flag);
-    
-    // 必须调用原函数
-    if(old_PacketEncode) old_PacketEncode(instance, packet, flag);
-}
-
-// =============================================================
-// 3. 核心逻辑：寻找真正的 il2cpp 基址 (体积策略)
+// 1. 核心逻辑：寻找真正的 il2cpp 基址 (体积策略)
 // =============================================================
 void* FindRealIl2CppBase() {
     FILE *fp = fopen("/proc/self/maps", "r");
@@ -74,9 +39,10 @@ void* FindRealIl2CppBase() {
 
     while (fgets(line, sizeof(line), fp)) {
         if (strstr(line, "r-xp")) {
+            // 只要是在 /data/app 下的 .so 都在嫌疑范围内
             if (strstr(line, "/data/app") && strstr(line, ".so")) {
                 
-                // 排除已知非目标
+                // 排除列表
                 if (strstr(line, "libunity.so") || 
                     strstr(line, "libmain.so") || 
                     strstr(line, "base.odex") || 
@@ -86,12 +52,12 @@ void* FindRealIl2CppBase() {
                 if (sscanf(line, "%lx-%lx", &start, &end) == 2) {
                     unsigned long size = end - start;
                     
-                    // 寻找大于 30MB 的段
+                    // 寻找大于 30MB 的段 (真身肯定很大)
                     if (size > 1024 * 1024 * 30) { 
                         if (size > max_size) {
                             max_size = size;
                             best_addr = (void*)start;
-                            LOGI("发现潜在目标 (Size: %lu bytes): %s", size, line);
+                            LOGI("发现潜在目标 (Size: %lu MB): %s", size / 1024 / 1024, line);
                         }
                     }
                 }
@@ -103,42 +69,50 @@ void* FindRealIl2CppBase() {
 }
 
 // =============================================================
-// 4. 主线程逻辑
+// 2. 主线程逻辑
 // =============================================================
 void hack_start(const char *game_data_dir) {
     LOGI(">>> HACK START: 正在寻找真正的 il2cpp 大文件... <<<");
 
     void* base_addr = nullptr;
     
+    // 死循环等待，直到找到那个大家伙
     while (true) {
         base_addr = FindRealIl2CppBase();
+        
         if (base_addr != nullptr) {
             LOGI("!!! 锁定真身 !!! Base Address: %p", base_addr);
             break;
         }
+        
         sleep(1);
     }
 
     // ---------------------------------------------------------
-    // 执行 Hook (偏移量来自 dump.cs)
+    // 验证偏移量 (Verify Offsets)
     // ---------------------------------------------------------
+    
+    // 你的 dump.cs 里的偏移量
     uintptr_t offset_PacketEncode = 0x11b54c8; 
+    
+    // 计算真实内存地址
     void* target_addr = (void*)((uintptr_t)base_addr + offset_PacketEncode);
     
-    LOGI(">>> 准备 Hook 地址: %p (Base+0x%lx) <<<", target_addr, offset_PacketEncode);
+    // 打印出来！这就是你要 Hook 的精确坐标！
+    LOGI("=================================================");
+    LOGI(">>> 分析结果报告 <<<");
+    LOGI("1. 真实基址: %p", base_addr);
+    LOGI("2. PacketEncode 偏移: 0x%lx", offset_PacketEncode);
+    LOGI("3. PacketEncode 真实地址: %p", target_addr);
+    LOGI("=================================================");
+    LOGI(">>> (Hook 已暂停，因为缺少 Dobby 库，先验证地址是否正确) <<<");
 
-    int ret = DobbyHook(target_addr, (void*)new_PacketEncode, (void**)&old_PacketEncode);
-    if (ret == 0) {
-        LOGI(">>> DobbyHook 返回成功! 监控中... <<<");
-    } else {
-        LOGI(">>> DobbyHook 失败，返回值: %d <<<", ret);
-    }
-    
+    // 保持线程存活
     while(true) sleep(10);
 }
 
 // =============================================================
-// 5. 固定模板代码 (NativeBridge & JNI入口) - 已包含所需头文件
+// 3. 固定模板代码 (NativeBridge & JNI入口)
 // =============================================================
 
 std::string GetLibDir(JavaVM *vms) {
@@ -170,7 +144,7 @@ std::string GetLibDir(JavaVM *vms) {
 }
 
 static std::string GetNativeBridgeLibrary() {
-    auto value = std::array<char, PROP_VALUE_MAX>(); // 这里之前报错，现在修复了
+    auto value = std::array<char, PROP_VALUE_MAX>();
     __system_property_get("ro.dalvik.vm.native.bridge", value.data());
     return {value.data()};
 }
@@ -217,7 +191,7 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size
     if (nb) {
         auto callbacks = (NativeBridgeCallbacks *) dlsym(nb, "NativeBridgeItf");
         if (callbacks) {
-            int fd = syscall(__NR_memfd_create, "anon", MFD_CLOEXEC); // 这里之前报错，现在修复了
+            int fd = syscall(__NR_memfd_create, "anon", MFD_CLOEXEC);
             ftruncate(fd, (off_t) length);
             void *mem = mmap(nullptr, length, PROT_WRITE, MAP_SHARED, fd, 0);
             memcpy(mem, data, length);
