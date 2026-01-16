@@ -28,29 +28,42 @@
 #include <unistd.h> // for sleep
 
 void hack_start(const char *game_data_dir) {
-    LOGI(">>> HACK START <<<");
+    // 换成英文日志，防止乱码
+    __android_log_print(ANDROID_LOG_INFO, "Perfare", ">>> HACK START: Waiting for libfvctyud.so... <<<");
 
-    // 1. 既然安装包里就是这个名字，直接打开它！
-    // 只要这一步拿到 handle，所有的 Hook 和 Dump 就都正常了
-    void *handle = xdl_open("libfvctyud.so", 0);
-
-    if (handle) {
-        LOGI(">>> 终于找到了！Handle: %p <<<", handle);
+    void *handle = nullptr;
+    
+    // 循环等待，直到找到为止 (或者超时)
+    // 很多游戏可能需要 5-10 秒才会加载核心 so
+    while (true) {
+        // 尝试打开目标 SO
+        handle = xdl_open("libfvctyud.so", 0);
         
-        // 2. 告诉 il2cppdumper："这就是你要的基址"
+        if (handle) {
+            // 找到了！跳出循环
+            __android_log_print(ANDROID_LOG_INFO, "Perfare", "!!! FOUND IT !!! Handle: %p", handle);
+            break;
+        }
+
+        // 没找到，打印个点，继续等
+        // 为了防止刷屏太快，可以把这个日志注释掉，或者每5秒打一次
+        // __android_log_print(ANDROID_LOG_INFO, "Perfare", "Waiting..."); 
+        
+        sleep(1); // 等待 1 秒
+    }
+
+    // 拿到 Handle 后，初始化并 Dump
+    if (handle) {
+        __android_log_print(ANDROID_LOG_INFO, "Perfare", ">>> Initializing API... <<<");
         il2cpp_api_init(handle);
         
-        // 3. 开始执行你的业务（Dump 或者 Hook）
-        il2cpp_dump(game_data_dir); 
-    } else {
-        LOGI(">>> 还是打不开 libfvctyud.so，见鬼了 <<<");
+        __android_log_print(ANDROID_LOG_INFO, "Perfare", ">>> Starting Dump... <<<");
+        il2cpp_dump(game_data_dir);
         
-        // 保底试一下原来的
-        void *fallback = xdl_open("libil2cpp.so", 0);
-        if(fallback) {
-             il2cpp_api_init(fallback);
-             il2cpp_dump(game_data_dir);
-        }
+        __android_log_print(ANDROID_LOG_INFO, "Perfare", ">>> Dump Done! <<<");
+    } else {
+        // 理论上死循环不会走到这里，除非你加了 break 条件
+        __android_log_print(ANDROID_LOG_INFO, "Perfare", "FATAL: Loop exited without handle");
     }
 }
 // -------------------------------------------------------------
