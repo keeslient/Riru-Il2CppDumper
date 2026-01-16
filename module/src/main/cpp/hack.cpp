@@ -60,55 +60,33 @@ uintptr_t get_module_base(const char* name) {
 
 // --- 3. 核心启动函数 ---
 void hack_start(const char *game_data_dir) {
-    LOGI("[🚀] 网络监控嗅探模式启动...");
-    
-    bool trap_done = false;
-    for (int i = 0; i < 60; i++) {
-        FILE* fp = fopen("/proc/self/maps", "r");
-        if (fp) {
-            char line[1024];
-            while (fgets(line, sizeof(line), fp)) {
-                // 搜索核心乱码库
-                if (!trap_done && strstr(line, ".so") && strstr(line, "/data/app") && 
-                    !strstr(line, "libmain.so") && !strstr(line, "libunity.so") && 
-                    !strstr(line, "libil2cpp.so")) {
-                    
-                    char* so_path = strchr(line, '/');
-                    char* so_name = strrchr(so_path, '/');
-                    if (so_name) {
-                        so_name++;
-                        so_name[strcspn(so_name, "\n")] = 0;
-                        
-                        uintptr_t base = get_module_base(so_name);
-                        if (base) {
-                            LOGI("[📡] 发现核心库: %s 基址: %p", so_name, (void*)base);
-                            // 自动抄家镜像
-                            char out_path[256];
-                            sprintf(out_path, "%s/%s_dump.bin", game_data_dir, so_name);
-                            FILE* wfp = fopen(out_path, "wb");
-                            if (wfp) {
-                                fwrite((void*)base, 1, 8 * 1024 * 1024, wfp);
-                                fclose(wfp);
-                                LOGI("[✅] 自动抄家成功: %s", out_path);
-                            }
-                            trap_done = true;
-                        }
-                    }
-                }
-            }
-            fclose(fp);
-        }
+    LOGI("[📡] 暴力嗅探雷达已启动，开始全内存搜索 Wireshark 特征包...");
 
-        void *handle = xdl_open("libil2cpp.so", 0);
-        if (handle) {
-            il2cpp_api_init(handle);
-            il2cpp_dump(game_data_dir);
-            break;
+    // 获取目标库基址
+    uintptr_t base = 0;
+    while (base == 0) {
+        base = get_module_base("libfvctyud.so");
+        sleep(1);
+    }
+
+    // 重点：我们不再等它触发，我们主动监控 libfvctyud.so 的数据段
+    // 假设它的数据段在基址往后 0x100000 左右
+    uintptr_t data_section = base + 0x100000; 
+
+    while (true) {
+        // 扫描内存中是否出现了 Wireshark 抓到的特征头：08 00 00 00
+        for (uintptr_t addr = data_section; addr < data_section + 0x50000; addr += 8) {
+            unsigned char* p = (unsigned char*)addr;
+            if (p[0] == 0x08 && p[1] == 0x00 && p[2] == 0x00 && p[3] == 0x00) {
+                LOGI("[🔥] 雷达发现疑似明文包！地址: %p", (void*)addr);
+                safe_hex_dump("捕获内容", addr, 64);
+                // 抓到后停一下，防止日志刷屏
+                sleep(2);
+            }
         }
-        ::sleep(2);
+        usleep(500000); // 每 0.5 秒扫一次
     }
 }
-
 // --- 4. Zygisk 调用的关键出口函数 ---
 // 修正：必须使用 extern "C" 或者确保与 hack.h 声明一致
 void hack_prepare(const char *game_data_dir, void *data, size_t length) {
