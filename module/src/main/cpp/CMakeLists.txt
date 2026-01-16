@@ -34,33 +34,16 @@ set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${LINKER_FLAGS}")
 set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} ${LINKER_FLAGS}")
 
 # ==============================================================================
-# 3. 【核弹修复】生成覆盖脚本 -> 强制重写汇编文件
+# 3. 【更换心脏】使用 MlgmXyysd/Dobby (LSPosed维护版)
 # ==============================================================================
 include(FetchContent)
 
-message(STATUS "Preparing Dobby Atomic Patch...")
+message(STATUS "Downloading MlgmXyysd Dobby (NDK25 Fixed)...")
 
-# [关键步骤] 在编译目录下生成一个 shell 脚本 'overwrite_asm.sh'
-# 这个脚本的内容就是：把正确的汇编代码写入到目标文件中
-file(WRITE ${CMAKE_BINARY_DIR}/overwrite_asm.sh "
-#!/bin/bash
-TARGET_FILE=\$1
-echo \"Overwriting \$TARGET_FILE with NDK25 compatible code...\"
-cat > \"\$TARGET_FILE\" <<EOF
-.text
-.align 2
-.global common_closure_bridge_trampoline
-common_closure_bridge_trampoline:
-    ldr x17, =common_closure_bridge_handler
-    br x17
-EOF
-")
-
-# 下载 Dobby 并执行上面的脚本
+# 这个分支修复了所有 C++20 和 NDK25 的兼容性问题
 FetchContent_Declare(
   dobby
-  URL https://github.com/jmpews/Dobby/archive/refs/heads/master.zip
-  PATCH_COMMAND bash ${CMAKE_BINARY_DIR}/overwrite_asm.sh ${CMAKE_BINARY_DIR}/_deps/dobby-src/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm
+  URL https://github.com/MlgmXyysd/Dobby/archive/refs/heads/master.zip
 )
 
 # 解压并配置
