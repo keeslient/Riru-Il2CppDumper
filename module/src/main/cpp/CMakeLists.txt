@@ -14,7 +14,7 @@ message("Build type: ${CMAKE_BUILD_TYPE}")
 set(CMAKE_CXX_STANDARD 20)
 
 # ==============================================================================
-# 2. 保持原有的 Flag 配置 (非常重要，防止 Riru/Zygisk 冲突)
+# 2. 保持原有的 Flag 配置
 # ==============================================================================
 set(LINKER_FLAGS "-ffixed-x18 -Wl,--hash-style=both")
 set(C_FLAGS "-Werror=format -fdata-sections -ffunction-sections")
@@ -34,14 +34,17 @@ set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${LINKER_FLAGS}")
 set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} ${LINKER_FLAGS}")
 
 # ==============================================================================
-# 3. 【新增】Dobby 在线源码编译配置 (无缝插入)
+# 3. 【关键修改】使用适配 NDK 25 的 Dobby 分支
 # ==============================================================================
 include(FetchContent)
 
-message(STATUS "Configuring Dobby...")
+message(STATUS "Configuring Dobby (Fork for NDK25+)...")
+
+# 官方 jmpews/Dobby 已不再维护，无法在 NDK25 编译。
+# 这里改用 Xposed-Modules-Repo 维护的分支，修复了 ARM64 汇编报错。
 FetchContent_Declare(
   dobby
-  GIT_REPOSITORY https://github.com/jmpews/Dobby.git
+  GIT_REPOSITORY https://github.com/Xposed-Modules-Repo/Dobby.git
   GIT_TAG        master
   GIT_SHALLOW    TRUE
 )
@@ -49,11 +52,11 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(dobby)
 
 # ==============================================================================
-# 4. 包含路径 (融合了 xdl 和 Dobby)
+# 4. 包含路径
 # ==============================================================================
 include_directories(
         xdl/include
-        ${dobby_SOURCE_DIR}/include  # <--- 新增这一行，让 hack.cpp 能找到 dobby.h
+        ${dobby_SOURCE_DIR}/include
 )
 
 aux_source_directory(xdl xdl-src)
@@ -68,15 +71,15 @@ add_library(${MODULE_NAME} SHARED
         ${xdl-src})
 
 # ==============================================================================
-# 6. 链接库 (加入 dobby)
+# 6. 链接库
 # ==============================================================================
 target_link_libraries(${MODULE_NAME} 
         log 
-        dobby # <--- 新增这一行，链接 Dobby 库
+        dobby # 链接 Dobby
 )
 
 # ==============================================================================
-# 7. 保持原本的 Strip 逻辑 (瘦身)
+# 7. 保持原本的 Strip 逻辑
 # ==============================================================================
 if (NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
     add_custom_command(TARGET ${MODULE_NAME} POST_BUILD
