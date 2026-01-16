@@ -18,7 +18,7 @@
 #include <array>
 #include <link.h>
 
-// 补全系统头文件
+// 系统头文件
 #include <sys/system_properties.h>
 #include <sys/syscall.h>
 #include <linux/unistd.h>
@@ -39,10 +39,8 @@ void* FindRealIl2CppBase() {
 
     while (fgets(line, sizeof(line), fp)) {
         if (strstr(line, "r-xp")) {
-            // 只要是在 /data/app 下的 .so 都在嫌疑范围内
             if (strstr(line, "/data/app") && strstr(line, ".so")) {
                 
-                // 排除列表
                 if (strstr(line, "libunity.so") || 
                     strstr(line, "libmain.so") || 
                     strstr(line, "base.odex") || 
@@ -52,11 +50,12 @@ void* FindRealIl2CppBase() {
                 if (sscanf(line, "%lx-%lx", &start, &end) == 2) {
                     unsigned long size = end - start;
                     
-                    // 寻找大于 30MB 的段 (真身肯定很大)
+                    // 寻找大于 30MB 的段
                     if (size > 1024 * 1024 * 30) { 
                         if (size > max_size) {
                             max_size = size;
                             best_addr = (void*)start;
+                            // 为了兼容性，size 使用 %lu 打印 unsigned long
                             LOGI("发现潜在目标 (Size: %lu MB): %s", size / 1024 / 1024, line);
                         }
                     }
@@ -76,7 +75,6 @@ void hack_start(const char *game_data_dir) {
 
     void* base_addr = nullptr;
     
-    // 死循环等待，直到找到那个大家伙
     while (true) {
         base_addr = FindRealIl2CppBase();
         
@@ -92,22 +90,19 @@ void hack_start(const char *game_data_dir) {
     // 验证偏移量 (Verify Offsets)
     // ---------------------------------------------------------
     
-    // 你的 dump.cs 里的偏移量
     uintptr_t offset_PacketEncode = 0x11b54c8; 
     
-    // 计算真实内存地址
     void* target_addr = (void*)((uintptr_t)base_addr + offset_PacketEncode);
     
-    // 打印出来！这就是你要 Hook 的精确坐标！
     LOGI("=================================================");
     LOGI(">>> 分析结果报告 <<<");
     LOGI("1. 真实基址: %p", base_addr);
-    LOGI("2. PacketEncode 偏移: 0x%lx", offset_PacketEncode);
+    // 【修复】这里改成 %p，并强转为 void*，兼容 32/64 位
+    LOGI("2. PacketEncode 偏移: %p", (void*)offset_PacketEncode);
     LOGI("3. PacketEncode 真实地址: %p", target_addr);
     LOGI("=================================================");
     LOGI(">>> (Hook 已暂停，因为缺少 Dobby 库，先验证地址是否正确) <<<");
 
-    // 保持线程存活
     while(true) sleep(10);
 }
 
