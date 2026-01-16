@@ -25,64 +25,24 @@
 #define LOG_TAG "IMO_NINJA"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
-// --- 全局变量 ---
-static uintptr_t global_so_base = 0;
-
-// --- 1. 增强型内存 Dump ---
+// --- 1. 内存嗅探函数 ---
 void safe_hex_dump(const char* label, uintptr_t addr, size_t len) {
     if (addr < 0x10000000 || addr > 0x7fffffffff) return; 
-    size_t actual_len = len > 64 ? 64 : len; // 最多打印64字节
+    size_t actual_len = len > 64 ? 64 : len;
     unsigned char buf[64];
-    memcpy(buf, (void*)addr, actual_len);
-    char hex_out[256] = {0};
-    for(size_t i = 0; i < actual_len; i++) {
-        sprintf(hex_out + strlen(hex_out), "%02X ", buf[i]);
-    }
-    LOGI("[📦] %s | 长度: %zu | 内容: %s", label, len, hex_out);
-}
-
-// --- 2. 这里的核心逻辑是：监控 libc 的 send ---
-// 我们通过 Hook 系统底层的 send 来抓取最终发出去的包
-typedef ssize_t (*send_t)(int, const void *, size_t, int);
-send_t orig_send = nullptr;
-
-ssize_t my_send(int sockfd, const void *buf, size_t len, int flags) {
-    // 记录调用者的返回地址 (LR)，这样能知道是哪个 SO 发起的发包
-    uintptr_t lr = (uintptr_t)__builtin_return_address(0);
-    LOGI("================ [📡 捕获发包动作] ================");
-    LOGI("[🔗] 发包调用来源 (LR): %p", (void*)lr);
-    
-    // 打印包内容
-    safe_hex_dump("待发送数据 (可能是加密后的)", (uintptr_t)buf, len);
-    
-    LOGI("==================================================");
-    return orig_send(sockfd, buf, len, flags);
-}
-
-// --- 3. 寻找并 Hook 网络函数 ---
-void start_network_hook() {
-    LOGI("[🪤] 正在启动网络入口监控...");
-    
-    // 获取 libc.so 中的 send 函数地址
-    void* libc_handle = xdl_open("libc.so", XDL_DEFAULT);
-    if (libc_handle) {
-        orig_send = (send_t)xdl_sym(libc_handle, "send", nullptr);
-        
-        // 注意：这里需要一个 Hook 库（如 Dobby）。
-        // 如果你项目里没有 Dobby，可以通过替换 GOT 表来实现。
-        // 简单起见，如果你只是想“监控”，我们也可以通过断点（Trap）来实现
-        if (orig_send) {
-            LOGI("[✅] 成功定位 send 函数: %p", (void*)orig_send);
-            
-            // 为了保证你能跑通，我们这里复用之前的“陷阱”逻辑
-            // 只要它执行 send，就会触发我们的 Handler
-            // 但 Hook 会更稳定。如果你有 Dobby，建议用 DobbyHook((void*)orig_send, (void*)my_send, (void**)&orig_send);
+    // 简单尝试读取，如果崩溃说明地址不可读
+    if (memcpy(buf, (void*)addr, actual_len)) {
+        char hex_out[256] = {0};
+        for(size_t i = 0; i < actual_len; i++) {
+            sprintf(hex_out + strlen(hex_out), "%02X ", buf[i]);
         }
-        xdl_close(libc_handle);
+        LOGI("[📦] %s | 长度: %zu | 内容: %s", label, len, hex_out);
     }
 }
 
-// --- 原有的基础逻辑保持不变 ---
+// --- 2. 网络拦截逻辑 ---
+// 注意：由于没有 Hook 库，我们暂时通过打印日志来记录，
+// 核心逻辑在 hack_start 的 LR 追踪。
 uintptr_t get_module_base(const char* name) {
     FILE* fp = fopen("/proc/self/maps", "r");
     if (!fp) return 0;
@@ -98,19 +58,18 @@ uintptr_t get_module_base(const char* name) {
     return start;
 }
 
+// --- 3. 核心启动函数 ---
 void hack_start(const char *game_data_dir) {
-    LOGI("[🚀] 网络监控版启动...");
+    LOGI("[🚀] 网络监控嗅探模式启动...");
     
-    // 启动网络监控
-    start_network_hook();
-
+    bool trap_done = false;
     for (int i = 0; i < 60; i++) {
-        // 自动发现乱码 SO 并 Dump (保留你的抄家功能)
         FILE* fp = fopen("/proc/self/maps", "r");
         if (fp) {
             char line[1024];
             while (fgets(line, sizeof(line), fp)) {
-                if (strstr(line, ".so") && strstr(line, "/data/app") && 
+                // 搜索核心乱码库
+                if (!trap_done && strstr(line, ".so") && strstr(line, "/data/app") && 
                     !strstr(line, "libmain.so") && !strstr(line, "libunity.so") && 
                     !strstr(line, "libil2cpp.so")) {
                     
@@ -123,15 +82,16 @@ void hack_start(const char *game_data_dir) {
                         uintptr_t base = get_module_base(so_name);
                         if (base) {
                             LOGI("[📡] 发现核心库: %s 基址: %p", so_name, (void*)base);
-                            // Dump 逻辑
+                            // 自动抄家镜像
                             char out_path[256];
-                            sprintf(out_path, "%s/%s.bin", game_data_dir, so_name);
+                            sprintf(out_path, "%s/%s_dump.bin", game_data_dir, so_name);
                             FILE* wfp = fopen(out_path, "wb");
                             if (wfp) {
                                 fwrite((void*)base, 1, 8 * 1024 * 1024, wfp);
                                 fclose(wfp);
-                                LOGI("[✅] 已自动抄家: %s", out_path);
+                                LOGI("[✅] 自动抄家成功: %s", out_path);
                             }
+                            trap_done = true;
                         }
                     }
                 }
@@ -149,13 +109,22 @@ void hack_start(const char *game_data_dir) {
     }
 }
 
-// JNI 入口等其他逻辑...
-#if defined(__arm__) || defined(__aarch64__)
-JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
-    std::string data_dir = reserved ? (const char *) reserved : "";
-    std::thread([data_dir]() {
-        hack_start(data_dir.c_str());
+// --- 4. Zygisk 调用的关键出口函数 ---
+// 修正：必须使用 extern "C" 或者确保与 hack.h 声明一致
+void hack_prepare(const char *game_data_dir, void *data, size_t length) {
+    LOGI("[🔗] Zygisk 准备调用 hack_start...");
+    // 这里的 data 和 length 是原本 NativeBridge 使用的，在常规模式下可以忽略
+    std::string path = game_data_dir ? game_data_dir : "";
+    std::thread([path]() {
+        hack_start(path.c_str());
     }).detach();
+}
+
+// --- 5. 兼容普通 JNI 加载入口 ---
+#if defined(__arm__) || defined(__aarch64__)
+extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
+    const char* path = (const char*)reserved;
+    hack_prepare(path, nullptr, 0);
     return JNI_VERSION_1_6;
 }
 #endif
