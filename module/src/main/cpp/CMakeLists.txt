@@ -34,20 +34,19 @@ set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${LINKER_FLAGS}")
 set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} ${LINKER_FLAGS}")
 
 # ==============================================================================
-# 3. 【精准修复】下载 Dobby 并按顺序修补汇编
+# 3. 【语法修正】下载 Dobby 并修复汇编 (使用 -e 参数避免解析错误)
 # ==============================================================================
 include(FetchContent)
 
 message(STATUS "Downloading Official Dobby & Patching for NDK25...")
 
 # 解释：
-# 1. 下载官方 master.zip (HTTP下载，避开 Git 权限问题)
-# 2. PATCH_COMMAND: 使用 sed 同时处理 @PAGEOFF 和 @PAGE
-#    注意顺序：必须先删 @PAGEOFF，否则会留下 OFF 尾巴导致编译失败！
+# 使用 -e 参数明确告诉 sed 这是脚本的一部分，而不是文件名。
+# 这样 CMake 在传递参数时绝对不会出错。
 FetchContent_Declare(
   dobby
   URL https://github.com/jmpews/Dobby/archive/refs/heads/master.zip
-  PATCH_COMMAND sed -i "s/@PAGEOFF//g;s/@PAGE//g" ${CMAKE_CURRENT_BINARY_DIR}/_deps/dobby-src/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm
+  PATCH_COMMAND sed -i -e s/@PAGEOFF//g -e s/@PAGE//g ${CMAKE_CURRENT_BINARY_DIR}/_deps/dobby-src/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm
 )
 
 # 解压并配置
