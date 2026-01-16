@@ -23,7 +23,7 @@
 #define LOG_TAG "IMO_NINJA"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
-// --- 内存打印 (带 ASCII 对照) ---
+// --- 内存打印 ---
 void safe_hex_dump(const char* label, uintptr_t addr, size_t len) {
 #if defined(__aarch64__)
     if (addr < 0x10000000 || addr > 0x7fffffffff) return;
@@ -33,77 +33,100 @@ void safe_hex_dump(const char* label, uintptr_t addr, size_t len) {
     unsigned char buf[64];
     size_t copy_len = len > 64 ? 64 : len;
     
-    // 尝试读取
     if (memcpy(buf, (void*)addr, copy_len)) {
         char hex_out[256] = {0};
         char text_out[64] = {0};
         for(size_t i = 0; i < copy_len; i++) {
             sprintf(hex_out + strlen(hex_out), "%02X ", buf[i]);
-            // 过滤非打印字符，方便看明文
+            // 只显示可见字符，其他的显示点
             text_out[i] = (buf[i] >= 32 && buf[i] <= 126) ? buf[i] : '.';
         }
+        // 打印发现的信息
         LOGI("\n========== [🔎 %s ] ==========\n地址: %p\nHEX : %s\nTEXT: %s\n==============================", 
              label, (void*)addr, hex_out, text_out);
     }
 }
 
-// --- 核心：极速双向雷达 ---
-void scan_for_packet_fast() {
-    LOGI("[📡] 极速雷达启动：同时搜索 00 22 (大端) 和 22 00 (小端)...");
+// --- 核心：Native 层精准扫描 ---
+void scan_native_memory() {
+    LOGI("[📡] 启动纯 Native 层扫描 (只看 SO 和 Native堆)...");
     
     while (true) {
         FILE* fp = fopen("/proc/self/maps", "r");
-        if (!fp) { usleep(100000); continue; } // 100ms 重试
+        if (!fp) { sleep(1); continue; }
         
         char line[1024];
         while (fgets(line, sizeof(line), fp)) {
-            // 重点关注：栈 (stack) 和 匿名堆 (libc_malloc)
-            // 因为临时组包通常在栈上，或者很小的堆内存里
-            if (strstr(line, "rw-p") && 
-               (strstr(line, "[stack]") || strstr(line, "[anon:libc_malloc]"))) {
-                
+            // 【1】黑名单：剔除 Java 层和系统层的所有干扰
+            if (strstr(line, "/system/") || strstr(line, "/vendor/") || strstr(line, "/apex/") ||
+                strstr(line, "dalvik") || strstr(line, "art") || 
+                strstr(line, ".dex") || strstr(line, ".jar") || strstr(line, ".apk") || 
+                strstr(line, "jit-cache")) {
+                continue;
+            }
+
+            // 【2】白名单：只扫我们关心的区域
+            bool is_target = false;
+            
+            // A. 游戏自带的 SO 库 (通常在 /data/app 下)
+            if (strstr(line, "/data/app") && strstr(line, ".so")) {
+                is_target = true;
+            }
+            // B. Native 堆内存 (malloc/new 分配出来的通常在这里)
+            // [heap], [anon:libc_malloc], [anon:scudo] 等
+            else if (strstr(line, "[heap]") || strstr(line, "[anon:libc_malloc]") || strstr(line, "[anon:scudo]")) {
+                is_target = true;
+            }
+            // C. 有些加固会把内存标为普通的 [anon:...] 但没有名字
+            // 如果它又是 rw-p 的，也有可能是缓冲区，暂时先放进来扫扫看
+            else if (strstr(line, "rw-p") && strstr(line, "[anon:")) {
+                is_target = true;
+            }
+
+            if (!is_target) continue;
+
+            // 必须是可读写的
+            if (strstr(line, "rw-p")) {
                 unsigned long tmp_start, tmp_end;
                 if (sscanf(line, "%lx-%lx", &tmp_start, &tmp_end) == 2) {
                     uintptr_t start = (uintptr_t)tmp_start;
                     uintptr_t end = (uintptr_t)tmp_end;
 
-                    // 优化：只扫前 512KB，提高速度，防止漏掉瞬时包
-                    if (end - start > 512 * 1024) end = start + 512 * 1024;
+                    // 限制扫描大小，防止卡死，只扫前 2MB
+                    if (end - start > 2 * 1024 * 1024) end = start + 2 * 1024 * 1024;
 
-                    for (uintptr_t addr = start; addr < end - 34; addr += 2) { // 步长改为2，防止错位
+                    // 步长为 2
+                    for (uintptr_t addr = start; addr < end - 34; addr += 2) {
                         unsigned char* p = (unsigned char*)addr;
-                        
-                        // 【修正点 1】匹配小端序 (22 00) -> 手机内存常用
-                        bool match_le = (p[0] == 0x22 && p[1] == 0x00);
-                        
-                        // 【修正点 2】匹配大端序 (00 22) -> 网络流常用
-                        bool match_be = (p[0] == 0x00 && p[1] == 0x22);
 
-                        if (match_le || match_be) {
-                            // 二次检查：你的加密包第3字节是 CE，如果是明文，这里绝不应该是 CE
-                            // 我们可以加一个简单的过滤器，比如第3字节必须是 00~0F (常见命令字)
-                            // 或者不做过滤，全部打印出来人工看
-                            
-                            safe_hex_dump(match_le ? "疑似明文(小端)" : "疑似明文(大端)", addr, 34);
-                            
-                            // 稍微停顿，避免单次扫描卡死，但要快
-                            // usleep(10); 
+                        // 目标长度: 34 (0x22)
+                        
+                        // 情况 1: 小端序 (22 00) -> 手机内存里最常见
+                        if (p[0] == 0x22 && p[1] == 0x00) {
+                            // 简单过滤：如果全是0肯定不是包
+                            if (p[2] != 0x00 || p[3] != 0x00) {
+                                safe_hex_dump("Native内存(小端)", addr, 34);
+                            }
+                        }
+                        // 情况 2: 大端序 (00 22) -> 即将发送的网络流
+                        else if (p[0] == 0x00 && p[1] == 0x22) {
+                             if (p[2] != 0x00 || p[3] != 0x00) {
+                                safe_hex_dump("Native内存(大端)", addr, 34);
+                             }
                         }
                     }
                 }
             }
         }
         fclose(fp);
-        
-        // 【修正点 3】极大缩短休眠时间，从 2秒 改为 0.2秒
-        // 必须快，才能抓住那 0.01 秒的瞬间
+        // 0.2秒扫一次，保持高频率
         usleep(200000); 
     }
 }
 
 // --- 启动入口 ---
 void hack_start(const char *game_data_dir) {
-    LOGI("[🚀] 猎杀者启动...");
+    LOGI("[🚀] Native 猎杀者启动...");
     
     // il2cpp dump (保留)
     void *handle = xdl_open("libil2cpp.so", 0);
@@ -112,8 +135,8 @@ void hack_start(const char *game_data_dir) {
         il2cpp_dump(game_data_dir);
     }
 
-    // 启动极速雷达
-    std::thread(scan_for_packet_fast).detach();
+    // 启动 Native 扫描
+    std::thread(scan_native_memory).detach();
 }
 
 // --- 接口 ---
