@@ -1,7 +1,9 @@
 //
 // Created by Perfare on 2020/7/4.
 //
-
+#include <fstream>
+#include <string>
+#include <iostream>
 #include "hack.h"
 #include "il2cpp_dump.h"
 #include "log.h"
@@ -22,37 +24,41 @@
 // 只修改了这里：尝试捕捉真身 libliapp.so
 // -------------------------------------------------------------
 void hack_start(const char *game_data_dir) {
-    // 1. 先打印一句，确保逻辑恢复正常 (能看到这句说明环境没问题)
-    __android_log_print(ANDROID_LOG_INFO, "Perfare", ">>> HACK_START: 恢复正常逻辑，准备寻找基址 <<<");
+    __android_log_print(ANDROID_LOG_INFO, "Perfare", ">>> HACK START: 开始扫描内存映射Maps <<<");
 
-    bool load = false;
-    for (int i = 0; i < 20; i++) { // 稍微增加一点尝试次数到20秒
-        
-        // 【核心修改】优先尝试直接打开 libliapp.so
-        // 既然你在内存字符串里看见了它，xdl 很有可能直接拿到它的句柄
-        void *handle = xdl_open("libliapp.so", 0);
-        
-        // 如果找不到 liapp，才去找 il2cpp (兼容逻辑)
-        if (!handle) {
-            handle = xdl_open("libil2cpp.so", 0);
-        }
+    // 打开当前进程的内存映射文件
+    FILE *fp = fopen("/proc/self/maps", "r");
+    if (fp == nullptr) {
+        __android_log_print(ANDROID_LOG_INFO, "Perfare", "FATAL: 无法读取 /proc/self/maps");
+        return;
+    }
 
-        if (handle) {
-            load = true;
-            // 打印一下我们到底拿到了谁的句柄，这能帮我们确认是不是钩到了真身
-            __android_log_print(ANDROID_LOG_INFO, "Perfare", ">>> 成功获取基址 Handle: %p <<<", handle);
-            
-            il2cpp_api_init(handle);
-            il2cpp_dump(game_data_dir);
-            break;
-        } else {
-            sleep(1);
+    char line[1024];
+    while (fgets(line, sizeof(line), fp)) {
+        // maps 的格式通常是：
+        // 7c00000000-7c00001000 r-xp 00000000 fd:00 12345 /data/app/..../libxxx.so
+        
+        // 我们只关心两个特征：
+        // 1. 它是可执行的 (包含 "r-xp")
+        // 2. 它的路径在 /data/app 里 (或者是匿名内存)
+        
+        if (strstr(line, "r-xp")) {
+            // 过滤掉系统库 (system/lib64)，只看游戏自己的
+            if (strstr(line, "/data/app") || strstr(line, "/data/data")) {
+                // 打印出来！真身就在这里面！
+                // 重点看有没有名字很奇怪的 .so，或者名字带有 split_config 的
+                __android_log_print(ANDROID_LOG_INFO, "Perfare", "发现可疑模块: %s", line);
+            }
+            // 有时候 LIAPP 会把代码放在匿名段里，没有文件名
+            else if (!strstr(line, "/")) {
+                 // 这种通常是 [anon:libc_malloc] 或者纯粹的地址
+                 // 量可能很大，暂不打印，先看上面那些有名字的
+            }
         }
     }
+    fclose(fp);
     
-    if (!load) {
-        LOGI("libil2cpp.so / libliapp.so not found in thread %d", gettid());
-    }
+    __android_log_print(ANDROID_LOG_INFO, "Perfare", ">>> 扫描结束 <<<");
 }
 
 // -------------------------------------------------------------
