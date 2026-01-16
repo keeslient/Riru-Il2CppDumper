@@ -1,6 +1,5 @@
 //
 // Created by Perfare on 2020/7/4.
-// Modified for LIAPP detection & Log Filtering
 //
 
 #include "hack.h"
@@ -17,44 +16,13 @@
 #include <sys/mman.h>
 #include <linux/unistd.h>
 #include <array>
-
-// =================【新增功能 1：防刷屏过滤器】=================
-#include <map>
-#include <mutex>
-#include <ctime>
-
-static std::map<void*, int> g_HitCounts;
-static std::map<void*, time_t> g_HitTimes;
-static std::mutex g_SpamMutex;
-
-// 可以在其他文件中调用的过滤器
-// true = 噪音(屏蔽) | false = 新数据(放行)
-bool IsSpam(void *address) {
-    std::lock_guard<std::mutex> lock(g_SpamMutex);
-    time_t now = time(nullptr);
-
-    // 如果是新地址或超时5秒，重置
-    if (g_HitTimes.find(address) == g_HitTimes.end() || (now - g_HitTimes[address] > 5)) {
-        g_HitCounts[address] = 1;
-        g_HitTimes[address] = now;
-        return false;
-    }
-
-    // 5秒内
-    g_HitCounts[address]++;
-    if (g_HitCounts[address] > 5) {
-        return true; // 超过5次屏蔽
-    }
-    return false;
-}
-
-// =================【新增功能 2：内存模块遍历】=================
+// 【新增】我们需要这个头文件来遍历内存模块
 #include <link.h>
 
-// 回调函数：打印加载的库信息
+// 【新增】回调函数：打印当前加载的所有模块
+// 这样我们就能在 Logcat 里看到到底有哪些 SO 被加载了，以及它们的真实地址
 static int print_libs_callback(struct dl_phdr_info* info, size_t size, void* data) {
-    // 只打印包含特定关键词的路径，或者是应用私有目录下的库，减少日志垃圾
-    // 这里的关键词你可以根据实际情况增加
+    // 过滤一下，只显示我们关心的（包含 com. 或者 data 路径，或者名字里带 il2cpp/liapp 的）
     if (info->dlpi_name && (
             strstr(info->dlpi_name, "com.") || 
             strstr(info->dlpi_name, "/data/") || 
@@ -63,53 +31,71 @@ static int print_libs_callback(struct dl_phdr_info* info, size_t size, void* dat
             strstr(info->dlpi_name, "unity"))) {
         
         LOGI("[🔍 发现模块] Name: %s | Base Address: %p", 
-             (strlen(info->dlpi_name) > 0 ? info->dlpi_name : "只读/匿名段(Anonymous)"), 
+             (strlen(info->dlpi_name) > 0 ? info->dlpi_name : "可能是匿名段(Anonymous)"), 
              (void*)info->dlpi_addr);
     }
     return 0;
 }
-// ============================================================
 
 void hack_start(const char *game_data_dir) {
-    // 1. 启动时先打印一遍内存里到底加载了谁，这步很关键！
-    LOGI("========== [START] Module Scan ==========");
+    // 1. 一上来先吼一声，证明代码跑起来了
+    LOGI(">>> HACK START: 正在扫描内存模块... <<<");
+    
+    // 2. 打印所有模块，请在日志里搜 "发现模块"
     dl_iterate_phdr(print_libs_callback, nullptr);
-    LOGI("========== [ END ] Module Scan ==========");
+    LOGI(">>> 扫描结束，开始寻找目标 SO <<<");
 
     bool load = false;
     void *handle = nullptr;
 
-    for (int i = 0; i < 10; i++) {
-        // 策略A: 优先尝试打开 libliapp.so (既然字符串里有它，内存里可能有)
+    // 3. 循环寻找目标，优先找 libliapp.so
+    for (int i = 0; i < 15; i++) { // 多试几次，给它点加载时间
+        
+        // --- 尝试 A: 找 libliapp.so ---
         handle = xdl_open("libliapp.so", 0);
         if (handle) {
             LOGI("!!! 成功定位到 libliapp.so !!! Base: %p", handle);
             load = true;
-            // 拿到句柄后，尝试初始化
+            // 找到真身后，直接开始 Dump
             il2cpp_api_init(handle);
             il2cpp_dump(game_data_dir);
             break;
         }
 
-        // 策略B: 回退尝试 libil2cpp.so (可能是诱饵，也可能是真的)
+        // --- 尝试 B: 找 libil2cpp.so (保底) ---
+        // 如果这里打印出来了，说明至少找到了诱饵
+        void* temp_handle = xdl_open("libil2cpp.so", 0);
+        if (temp_handle) {
+             LOGI(">>> 发现 libil2cpp.so (可能是壳) Base: %p", temp_handle);
+             // 先不急着 break，继续循环看看能不能等到 liapp 出现
+             // 如果你确定只要 il2cpp，可以把下面两行注释解开
+             // handle = temp_handle;
+             // load = true; break;
+        }
+
+        sleep(1);
+    }
+    
+    // 如果最后还是没找到 liapp，但找到了 il2cpp，那就用 il2cpp 兜底
+    if (!load && !handle) {
         handle = xdl_open("libil2cpp.so", 0);
         if (handle) {
-            LOGI("定位到 libil2cpp.so (可能是壳/诱饵) Base: %p", handle);
+            LOGI(">>> 最终回退使用 libil2cpp.so <<<");
             load = true;
             il2cpp_api_init(handle);
             il2cpp_dump(game_data_dir);
-            break;
-        } 
-        
-        sleep(1);
+        }
     }
 
     if (!load) {
-        LOGI("Target SO (libil2cpp/libliapp) not found in thread %d", gettid());
+        LOGI("FATAL: 真的找不到了 (Target SO not found) thread %d", gettid());
     }
 }
 
-// 下面的代码保持原样，未做逻辑修改，仅保留完整性
+// -----------------------------------------------------------
+// 以下代码未修改，保持原样
+// -----------------------------------------------------------
+
 std::string GetLibDir(JavaVM *vms) {
     JNIEnv *env = nullptr;
     vms->AttachCurrentThread(&env, nullptr);
