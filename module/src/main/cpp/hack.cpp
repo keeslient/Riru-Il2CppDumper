@@ -42,51 +42,55 @@ void safe_hex_dump(const char* label, uintptr_t addr, size_t len) {
 }
 
 // --- 1. 增强版信号处理函数 ---
+// --- 1. 增强版信号处理函数 (自动重置陷阱版) ---
 void sbox_trap_handler(int sig, siginfo_t *info, void *context) {
     auto* ctx = (ucontext_t*)context;
     
+    // 增加一个简单的判定：只有确实是访问 S 盒导致的异常才处理
+    // info->si_addr 是触发异常的具体内存地址
+    if ((uintptr_t)info->si_addr == global_sbox_addr) {
+        
 #if defined(__aarch64__)
-    uintptr_t pc = ctx->uc_mcontext.pc;
-    uintptr_t lr = ctx->uc_mcontext.regs[30]; // LR 寄存器，存储返回地址
-    uintptr_t rel_pc = pc - global_so_base;
-    uintptr_t rel_lr = lr - global_so_base;
+        uintptr_t pc = ctx->uc_mcontext.pc;
+        uintptr_t lr = ctx->uc_mcontext.regs[30];
+        uintptr_t rel_pc = pc - global_so_base;
+        uintptr_t rel_lr = lr - global_so_base;
 
-    LOGI("================ [🚨 捕获加密现场] ================");
-    LOGI("[🎯] 当前加密指令偏移 (PC): 0x%lx", (long)rel_pc);
-    LOGI("[🔗] 调用者函数偏移 (LR): 0x%lx (查看谁在发包)", (long)rel_lr);
-    
-    // 嗅探寄存器 X0-X3 的内存内容
-    safe_hex_dump("寄存器 X0", (uintptr_t)ctx->uc_mcontext.regs[0], 32);
-    safe_hex_dump("寄存器 X1", (uintptr_t)ctx->uc_mcontext.regs[1], 32);
-    safe_hex_dump("寄存器 X2", (uintptr_t)ctx->uc_mcontext.regs[2], 32);
+        LOGI("================ [🚨 捕获加密现场] ================");
+        LOGI("[🎯] 当前指令偏移 (PC): 0x%lx", (long)rel_pc);
+        LOGI("[🔗] 调用者偏移 (LR): 0x%lx", (long)rel_lr);
+        
+        // 打印寄存器内容，看看是不是封包明文
+        safe_hex_dump("寄存器 X0", (uintptr_t)ctx->uc_mcontext.regs[0], 32);
+        safe_hex_dump("寄存器 X1", (uintptr_t)ctx->uc_mcontext.regs[1], 32);
+        safe_hex_dump("寄存器 X2", (uintptr_t)ctx->uc_mcontext.regs[2], 32);
 
 #elif defined(__arm__)
-    uintptr_t pc = ctx->uc_mcontext.arm_pc;
-    uintptr_t lr = ctx->uc_mcontext.arm_lr;
-    LOGI("================ [🚨 捕获加密现场 32位] ================");
-    LOGI("[🎯] PC偏移: 0x%lx, LR偏移: 0x%lx", (long)(pc - global_so_base), (long)(lr - global_so_base));
+        uintptr_t pc = ctx->uc_mcontext.arm_pc;
+        uintptr_t lr = ctx->uc_mcontext.arm_lr;
+        LOGI("================ [🚨 捕获加密现场 32位] ================");
+        LOGI("[🎯] PC: 0x%lx, LR: 0x%lx", (long)(pc - global_so_base), (long)(lr - global_so_base));
 #endif
 
-    // 恢复权限，允许这一条指令通过
-    mprotect((void*)(global_sbox_addr & ~0xFFF), 4096, PROT_READ);
-    LOGI("==================================================");
-}
+        // --- 核心修改：陷阱重置逻辑 ---
+        // 1. 先临时恢复“可读”权限，让当前这条指令能执行成功
+        mprotect((void*)(global_sbox_addr & ~0xFFF), 4096, PROT_READ);
 
-uintptr_t get_module_base(const char* name) {
-    FILE* fp = fopen("/proc/self/maps", "r");
-    if (!fp) return 0;
-    char line[1024];
-    uintptr_t start = 0;
-    while (fgets(line, sizeof(line), fp)) {
-        if (strstr(line, name)) {
-            start = (uintptr_t)strtoull(line, nullptr, 16);
-            break;
-        }
+        // 2. 开启异步线程，等待一瞬间后再次关闭权限
+        // 这样可以实现持续监控，而不会导致游戏卡死
+        std::thread([]() {
+            usleep(50000); // 等待 50 毫秒，足够 CPU 执行完当前加密函数了
+            if (global_sbox_addr != 0) {
+                mprotect((void*)(global_sbox_addr & ~0xFFF), 4096, PROT_NONE);
+                // LOGI("[🔄] 陷阱已重新布设"); // 调试稳了可以关掉这行，防止刷屏
+            }
+        }).detach();
+
+        LOGI("==================================================");
     }
-    fclose(fp);
-    return start;
 }
 
+// --- 2. 修改后的 Dump 和布阵函数 (删除了自检) ---
 void dump_and_trap(const char* so_name, const char* game_data_dir) {
     uintptr_t base = get_module_base(so_name);
     if (!base) return;
@@ -94,6 +98,7 @@ void dump_and_trap(const char* so_name, const char* game_data_dir) {
     global_so_base = base;
     LOGI("[📡] 锁定目标 %s，基址: %p", so_name, (void*)base);
 
+    // 执行 Dump
     size_t dump_size = 8 * 1024 * 1024; 
     char path[256];
     sprintf(path, "%s/%s.bin", game_data_dir, "liapp_core_auto");
@@ -105,6 +110,7 @@ void dump_and_trap(const char* so_name, const char* game_data_dir) {
         LOGI("[✅] 抄家成功: %s", path);
     }
 
+    // 设置信号
     global_sbox_addr = base + SBOX_OFFSET;
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -112,12 +118,11 @@ void dump_and_trap(const char* so_name, const char* game_data_dir) {
     sa.sa_sigaction = sbox_trap_handler;
     sigaction(SIGSEGV, &sa, NULL);
 
+    // 将 S 盒设为不可访问 (PROT_NONE)
     mprotect((void*)(global_sbox_addr & ~0xFFF), 4096, PROT_NONE);
-    LOGI("[🪤] AES 陷阱已布在 %s 偏移 0x%lx 处", so_name, (long)SBOX_OFFSET);
+    LOGI("[🪤] AES 陷阱已布在 %s 偏移 0x%lx 处，等待游戏触发...", so_name, (long)SBOX_OFFSET);
     
-    // 手动测试
-    volatile char test = *(char*)global_sbox_addr;
-    LOGI("[🧪] 手动触发测试完成，读取到: %02x", test);
+    // 【重点：这里不再写自检读取代码了！】
 }
 
 // --- 官方原有辅助函数保持不变 ---
