@@ -221,9 +221,19 @@ void hack_prepare(const char *game_data_dir, void *data, size_t length) {
 
 #if defined(__arm__) || defined(__aarch64__)
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
-    auto game_data_dir = (const char *) reserved;
-    std::thread hack_thread(hack_start, game_data_dir);
+    // 关键修正：将指针内容转存为 std::string，避免异步线程访问已释放的内存
+    std::string data_dir = "";
+    if (reserved != nullptr) {
+        data_dir = (const char *)reserved;
+    }
+
+    // 使用 Lambda 表达式捕获 string 对象
+    std::thread hack_thread([data_dir]() {
+        hack_start(data_dir.c_str());
+    });
+    
     hack_thread.detach();
     return JNI_VERSION_1_6;
 }
+#endif
 #endif
