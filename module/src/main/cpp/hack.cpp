@@ -1,6 +1,6 @@
 #include "hack.h"
 #include "log.h"
-#include "xdl.h" // 保持引用以免编译报错，虽然下面没用到
+#include "xdl.h" 
 #include <cstring>
 #include <cstdio>
 #include <unistd.h>
@@ -38,18 +38,15 @@ std::string hexStr(unsigned char *data, int len) {
 
 // =============================================================
 // 信号处理 (核心逻辑)
-// 当 CPU 执行到我们写入的 BRK 指令时，会触发这里
 // =============================================================
 void TrapHandler(int signum, siginfo_t *info, void *context) {
+    // 【修复】将整个逻辑包在 64 位宏定义里，防止 32 位编译报错
+    #if defined(__aarch64__)
     ucontext_t *uc = (ucontext_t *)context;
     
     // 获取当前 PC 指针
-    #if defined(__aarch64__)
     uintptr_t pc = uc->uc_mcontext.pc;
     uintptr_t x1_packet = uc->uc_mcontext.regs[1]; // 参数2: Packet对象
-    #else
-    return;
-    #endif
 
     // 判断是不是我们要拦截的地址
     if (pc == g_target_addr) {
@@ -81,11 +78,8 @@ void TrapHandler(int signum, siginfo_t *info, void *context) {
 
         g_trap_triggered = true;
         LOGI(">>> 指令已还原，放行游戏 (One-Shot 成功) <<<");
-        
-        // 注意：这个断点是一次性的。
-        // 抓到第一次数据证明成功后，如果需要持续抓，逻辑会极其复杂。
-        // 先确保能抓到这一条！
     }
+    #endif
 }
 
 // =============================================================
@@ -107,8 +101,10 @@ void InstallSoftwareBreakpoint(uintptr_t addr) {
     g_backup_instruction = *(uint32_t*)addr;
     LOGI("备份原始指令: %08x", g_backup_instruction);
 
-    // 4. 写入自爆指令 BRK #0 (Hex: D4200000)
+    // 4. 写入自爆指令 BRK #0 (Hex: D4200000 - AArch64专用)
+    #if defined(__aarch64__)
     *(uint32_t*)addr = 0xD4200000;
+    #endif
     
     // 5. 刷新缓存
     __builtin___clear_cache((char*)addr, (char*)addr + 4);
@@ -182,7 +178,7 @@ void hack_start(const char *game_data_dir) {
     while(true) sleep(10);
 }
 
-// 模板代码 (保持不变)
+// 模板代码
 std::string GetLibDir(JavaVM *vms) { return ""; }
 static std::string GetNativeBridgeLibrary() { return ""; }
 bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size_t length) { return false; }
