@@ -21,12 +21,12 @@
 #define LOG_TAG "IMO_NINJA"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
-// --- 全局变量：用于陷阱监控 ---
+// --- 陷阱配置区 ---
 static uintptr_t global_sbox_addr = 0;
 static uintptr_t global_so_base = 0;
 static const uintptr_t SBOX_OFFSET = 0x89F90; // AES S-Box 偏移
 
-// --- 信号处理函数：捕获加密现场 ---
+// --- 1. 信号处理函数 (捕兽夹核心) ---
 void sbox_trap_handler(int sig, siginfo_t *info, void *context) {
     auto* ctx = (ucontext_t*)context;
     uintptr_t pc = ctx->uc_mcontext.pc;
@@ -35,18 +35,18 @@ void sbox_trap_handler(int sig, siginfo_t *info, void *context) {
     LOGI("================ [🚨 捕获加密动作] ================");
     LOGI("[🎯] 触发指令偏移 (PC): 0x%lx", (long)relative_pc);
     
-    // 打印前 8 个寄存器，寻找明文和 Key 的线索
+    // 打印前 8 个通用寄存器，寻找明文指针
     for(int i = 0; i < 8; i++) {
-        LOGI("[💎] 寄存器 X%d: 0x%llx", i, ctx->uc_mcontext.regs[i]);
+        LOGI("[💎] 寄存器 X%d: 0x%llx", i, (unsigned long long)ctx->uc_mcontext.regs[i]);
     }
 
-    // 必须恢复权限，否则 CPU 无法完成当前指令，会导致死循环
+    // 必须恢复读取权限，否则 CPU 会卡死在这一条指令上
     mprotect((void*)(global_sbox_addr & ~0xFFF), 4096, PROT_READ);
-    LOGI("[✅] 陷阱已触发，权限已临时恢复，请分析上方寄存器。");
+    LOGI("[✅] 权限已临时恢复，请对比 Wireshark 记录分析寄存器。");
     LOGI("==================================================");
 }
 
-// --- 工具函数：获取模块基址 ---
+// --- 2. 抄家辅助：获取模块基址 ---
 uintptr_t get_module_base(const char* name) {
     FILE* fp = fopen("/proc/self/maps", "r");
     if (!fp) return 0;
@@ -62,26 +62,27 @@ uintptr_t get_module_base(const char* name) {
     return start;
 }
 
-// --- 核心：内存镜像 Dump 函数 ---
-void dump_memory_mirror(const char* so_name, const char* out_name) {
+// --- 3. 核心：抄家并布阵 ---
+void dump_and_trap(const char* so_name, const char* game_data_dir) {
     uintptr_t base = get_module_base(so_name);
     if (!base) return;
 
-    global_so_base = base; // 记录基址供陷阱使用
-    LOGI("[📡] 发现目标库 %s，基址: %p，准备抄家...", so_name, (void*)base);
+    global_so_base = base;
+    LOGI("[📡] 锁定目标 %s，基址: %p", so_name, (void*)base);
 
+    // 执行 Dump
     size_t dump_size = 8 * 1024 * 1024; 
     char path[256];
-    sprintf(path, "/sdcard/Android/data/com.com2us.imo.normal.freefull.google.global.android.common/files/%s", out_name);
-
+    sprintf(path, "%s/%s.bin", game_data_dir, "liapp_core_auto");
+    
     FILE* fp = fopen(path, "wb");
     if (fp) {
         fwrite((void*)base, 1, dump_size, fp);
         fclose(fp);
-        LOGI("[✅] 抄家成功！镜像已保存至: %s", path);
+        LOGI("[✅] 抄家成功: %s", path);
     }
 
-    // --- 在此处顺便布下捕兽夹 ---
+    // 布下陷阱
     global_sbox_addr = base + SBOX_OFFSET;
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -89,18 +90,17 @@ void dump_memory_mirror(const char* so_name, const char* out_name) {
     sa.sa_sigaction = sbox_trap_handler;
     sigaction(SIGSEGV, &sa, NULL);
 
-    // 将 S 盒所在页设为不可访问
-    if (mprotect((void*)(global_sbox_addr & ~0xFFF), 4096, PROT_NONE) == 0) {
-        LOGI("[🪤] 针对 %s 的 AES 陷阱已布好！", so_name);
-    }
+    mprotect((void*)(global_sbox_addr & ~0xFFF), 4096, PROT_NONE);
+    LOGI("[🪤] AES 陷阱已布在 %s 偏移 0x%lx 处", so_name, (long)SBOX_OFFSET);
 }
 
-// --- 补全 Dumper 必要函数 ---
+// --- 以下为官方原版逻辑，保持不变 ---
+
 std::string GetLibDir(JavaVM *vms) {
     JNIEnv *env = nullptr;
     vms->AttachCurrentThread(&env, nullptr);
     jclass activity_thread_clz = env->FindClass("android/app/ActivityThread");
-    if (activity_thread_clz) {
+    if (activity_thread_clz != nullptr) {
         jmethodID currentApplicationId = env->GetStaticMethodID(activity_thread_clz, "currentApplication", "()Landroid/app/Application;");
         if (currentApplicationId) {
             jobject application = env->CallStaticObjectMethod(activity_thread_clz, currentApplicationId);
@@ -111,11 +111,11 @@ std::string GetLibDir(JavaVM *vms) {
                     jobject application_info = env->CallObjectMethod(application, get_application_info);
                     jfieldID native_library_dir_id = env->GetFieldID(env->GetObjectClass(application_info), "nativeLibraryDir", "Ljava/lang/String;");
                     if (native_library_dir_id) {
-                        auto jstr = (jstring) env->GetObjectField(application_info, native_library_dir_id);
-                        auto path = env->GetStringUTFChars(jstr, nullptr);
-                        std::string res(path);
-                        env->ReleaseStringUTFChars(jstr, path);
-                        return res;
+                        auto native_library_dir_jstring = (jstring) env->GetObjectField(application_info, native_library_dir_id);
+                        auto path = env->GetStringUTFChars(native_library_dir_jstring, nullptr);
+                        std::string lib_dir(path);
+                        env->ReleaseStringUTFChars(native_library_dir_jstring, path);
+                        return lib_dir;
                     }
                 }
             }
@@ -131,84 +131,99 @@ static std::string GetNativeBridgeLibrary() {
 }
 
 struct NativeBridgeCallbacks {
-    uint32_t version; void *initialize;
+    uint32_t version;
+    void *initialize;
     void *(*loadLibrary)(const char *libpath, int flag);
     void *(*getTrampoline)(void *handle, const char *name, const char *shorty, uint32_t len);
     void *isSupported; void *getAppEnv; void *isCompatibleWith; void *getSignalHandler;
     void *unloadLibrary; void *getError; void *isPathSupported; void *initAnonymousNamespace;
-    void *createNamespace; void *linkNamespaces; void *(*loadLibraryExt)(const char *libpath, int flag, void *ns);
+    void *createNamespace; void *linkNamespaces;
+    void *(*loadLibraryExt)(const char *libpath, int flag, void *ns);
 };
 
-bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size_t length) {
-    ::sleep(5);
-    auto libart = dlopen("libart.so", RTLD_NOW);
-    auto JNI_GetCreatedJavaVMs = (jint (*)(JavaVM **, jsize, jsize *)) dlsym(libart, "JNI_GetCreatedJavaVMs");
-    JavaVM *vms_buf[1]; jsize num_vms;
-    jint status = JNI_GetCreatedJavaVMs(vms_buf, 1, &num_vms);
-    if (status != JNI_OK || num_vms <= 0) return false;
-    JavaVM *vms = vms_buf[0];
-    auto lib_dir = GetLibDir(vms);
-    if (lib_dir.empty() || lib_dir.find("/lib/x86") != std::string::npos) return false;
-    auto nb = ::dlopen("libhoudini.so", RTLD_NOW);
-    if (!nb) nb = ::dlopen(GetNativeBridgeLibrary().data(), RTLD_NOW);
-    if (nb) {
-        auto callbacks = (NativeBridgeCallbacks *) dlsym(nb, "NativeBridgeItf");
-        if (callbacks) {
-            int fd = syscall(__NR_memfd_create, "anon", MFD_CLOEXEC);
-            ftruncate(fd, (off_t) length);
-            void *mem = mmap(nullptr, length, PROT_WRITE, MAP_SHARED, fd, 0);
-            memcpy(mem, data, length); munmap(mem, length);
-            char path[PATH_MAX]; snprintf(path, PATH_MAX, "/proc/self/fd/%d", fd);
-            void *arm_handle = (api_level >= 26) ? callbacks->loadLibraryExt(path, RTLD_NOW, (void *) 3) : callbacks->loadLibrary(path, RTLD_NOW);
-            if (arm_handle) {
-                auto init = (void (*)(JavaVM *, void *)) callbacks->getTrampoline(arm_handle, "JNI_OnLoad", nullptr, 0);
-                init(vms, (void *) game_data_dir);
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
+// 官方原版 hack_start
 void hack_start(const char *game_data_dir) {
-    LOGI("[🚀] 整合版智能抄家 + 陷阱模式启动...");
-    
+    LOGI("[🚀] 整合版注入成功，等待 libil2cpp...");
+    bool load = false;
     for (int i = 0; i < 60; i++) {
+        // 1. 先尝试捕获乱码 SO 并布阵
         FILE* fp = fopen("/proc/self/maps", "r");
         if (fp) {
             char line[1024];
             while (fgets(line, sizeof(line), fp)) {
                 if (strstr(line, ".so") && strstr(line, "/data/app") && 
                     !strstr(line, "libmain.so") && !strstr(line, "libunity.so") && 
-                    !strstr(line, "libil2cpp.so") && !strstr(line, "libreal.so")) {
+                    !strstr(line, "libil2cpp.so")) {
                     
                     char* so_path = strchr(line, '/');
                     char* so_name = strrchr(so_path, '/');
                     if (so_name) {
-                        so_name++; 
+                        so_name++;
                         so_name[strcspn(so_name, "\n")] = 0;
-                        
-                        // 调用 Dump 并在内部布下陷阱
-                        dump_memory_mirror(so_name, "liapp_core_auto.bin");
+                        dump_and_trap(so_name, game_data_dir);
                     }
                 }
             }
             fclose(fp);
         }
 
+        // 2. 检查 il2cpp (官方原有 Dumper 逻辑)
         void *handle = xdl_open("libil2cpp.so", 0);
         if (handle) {
-            LOGI("[✅] libil2cpp 已加载，常规 Dumper 启动...");
+            load = true;
             il2cpp_api_init(handle);
             il2cpp_dump(game_data_dir);
-            break; 
+            break;
+        } else {
+            sleep(2);
         }
-        ::sleep(2);
+    }
+    if (!load) {
+        LOGI("libil2cpp.so not found in thread %d", gettid());
     }
 }
 
+bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size_t length) {
+    sleep(5);
+    auto libart = dlopen("libart.so", RTLD_NOW);
+    auto JNI_GetCreatedJavaVMs = (jint (*)(JavaVM **, jsize, jsize *)) dlsym(libart, "JNI_GetCreatedJavaVMs");
+    JavaVM *vms_buf[1];
+    jsize num_vms;
+    jint status = JNI_GetCreatedJavaVMs(vms_buf, 1, &num_vms);
+    if (status != JNI_OK || num_vms <= 0) return false;
+    
+    JavaVM *vms = vms_buf[0];
+    auto lib_dir = GetLibDir(vms);
+    if (lib_dir.empty() || lib_dir.find("/lib/x86") != std::string::npos) {
+        munmap(data, length);
+        return false;
+    }
+
+    auto nb = dlopen("libhoudini.so", RTLD_NOW);
+    if (!nb) nb = dlopen(GetNativeBridgeLibrary().data(), RTLD_NOW);
+    
+    if (nb) {
+        auto callbacks = (NativeBridgeCallbacks *) dlsym(nb, "NativeBridgeItf");
+        if (callbacks) {
+            int fd = syscall(__NR_memfd_create, "anon", MFD_CLOEXEC);
+            ftruncate(fd, (off_t) length);
+            void *mem = mmap(nullptr, length, PROT_WRITE, MAP_SHARED, fd, 0);
+            memcpy(mem, data, length); munmap(mem, length); munmap(data, length);
+            char path[PATH_MAX]; snprintf(path, PATH_MAX, "/proc/self/fd/%d", fd);
+            
+            void *arm_handle = (api_level >= 26) ? callbacks->loadLibraryExt(path, RTLD_NOW, (void *) 3) : callbacks->loadLibrary(path, RTLD_NOW);
+            if (arm_handle) {
+                auto init = (void (*)(JavaVM *, void *)) callbacks->getTrampoline(arm_handle, "JNI_OnLoad", nullptr, 0);
+                init(vms, (void *) game_data_dir);
+                return true;
+            }
+            close(fd);
+        }
+    }
+    return false;
+}
+
 void hack_prepare(const char *game_data_dir, void *data, size_t length) {
-    LOGI("======================================");
     int api_level = android_get_device_api_level();
 #if defined(__i386__) || defined(__x86_64__)
     if (!NativeBridgeLoad(game_data_dir, api_level, data, length)) {
@@ -221,19 +236,11 @@ void hack_prepare(const char *game_data_dir, void *data, size_t length) {
 
 #if defined(__arm__) || defined(__aarch64__)
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
-    // 关键修正：将指针内容转存为 std::string，避免异步线程访问已释放的内存
-    std::string data_dir = "";
-    if (reserved != nullptr) {
-        data_dir = (const char *)reserved;
-    }
-
-    // 使用 Lambda 表达式捕获 string 对象
-    std::thread hack_thread([data_dir]() {
+    // 关键修正：确保异步线程不会丢失 reserved 里的路径
+    std::string data_dir = reserved ? (const char *) reserved : "";
+    std::thread([data_dir]() {
         hack_start(data_dir.c_str());
-    });
-    
-    hack_thread.detach();
+    }).detach();
     return JNI_VERSION_1_6;
 }
-#endif
 #endif
