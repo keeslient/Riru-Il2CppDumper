@@ -40,44 +40,48 @@ std::string hexStr(unsigned char *data, int len) {
 // 信号处理 (核心逻辑)
 // =============================================================
 void TrapHandler(int signum, siginfo_t *info, void *context) {
-    // 【修复】将整个逻辑包在 64 位宏定义里，防止 32 位编译报错
     #if defined(__aarch64__)
     ucontext_t *uc = (ucontext_t *)context;
-    
-    // 获取当前 PC 指针
     uintptr_t pc = uc->uc_mcontext.pc;
-    uintptr_t x1_packet = uc->uc_mcontext.regs[1]; // 参数2: Packet对象
+    uintptr_t x1_packet = uc->uc_mcontext.regs[1]; // x1 = SendingPacket 对象
 
-    // 判断是不是我们要拦截的地址
     if (pc == g_target_addr) {
-        LOGI(">>> [软件断点命中] 抓到发包了!!! <<<");
+        LOGI(">>> [软件断点命中] 抓到 Packet 对象! <<<");
         
-        // 1. 打印数据
         if (x1_packet != 0) {
-            unsigned char* ptr = (unsigned char*)x1_packet;
-            // 尝试打印前 128 字节 (Packet 内容)
-            LOGI("Packet Addr: %p", ptr);
-            LOGI("Data: %s", hexStr(ptr, 128).c_str());
-        } else {
-            LOGI("Packet Addr is NULL");
+            // 1. 打印 Packet 对象本身 (盒子)
+            // LOGI("Packet Obj: %p", (void*)x1_packet);
+
+            // 2. 【核心修改】尝试读取里面的 Buffer
+            // 在 64位 Unity 中，第一个字段通常在偏移 0x10
+            uintptr_t field_1_ptr = *(uintptr_t*)(x1_packet + 0x10);
+            
+            if (field_1_ptr != 0) {
+                LOGI(">>> 发现内部 Buffer 指针: %p <<<", (void*)field_1_ptr);
+                
+                // 3. 读取 Buffer 的内容
+                // C# 数组结构: [Header 0x00-0x10] [Length 0x18] [Data 0x20...]
+                // 我们直接读偏移 0x20 处的数据，这就是真正的明文封包！
+                
+                unsigned char* data_ptr = (unsigned char*)(field_1_ptr + 0x20);
+                
+                // 为了防止野指针崩溃，简单检查一下地址合法性(简略版)
+                // 这里直接打印，如果闪退说明偏移不对，但这通常是通用的
+                LOGI("=== 真实封包内容 (Hex) ===");
+                LOGI("%s", hexStr(data_ptr, 128).c_str()); 
+                LOGI("==========================");
+            } else {
+                LOGI("Buffer 指针为空，可能偏移量不是 0x10");
+            }
         }
 
-        // =================================================
-        // 2. 还原现场 (必须做，不然游戏会崩)
-        // =================================================
-        
-        // 修改内存权限为可写
+        // --- 下面是还原逻辑，保持不变 ---
         void *page_start = (void *)(g_target_addr & ~(getpagesize() - 1));
         mprotect(page_start, getpagesize(), PROT_READ | PROT_WRITE | PROT_EXEC);
-
-        // 还原原始指令 (把 BRK 改回 fb 6b bb a9)
         *(uint32_t*)g_target_addr = g_backup_instruction;
-
-        // 刷新 CPU 指令缓存 (告诉 CPU 代码变了)
         __builtin___clear_cache((char*)g_target_addr, (char*)g_target_addr + 4);
-
         g_trap_triggered = true;
-        LOGI(">>> 指令已还原，放行游戏 (One-Shot 成功) <<<");
+        LOGI(">>> 指令已还原，游戏继续 <<<");
     }
     #endif
 }
