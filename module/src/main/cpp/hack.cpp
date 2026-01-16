@@ -28,43 +28,52 @@
 #include <unistd.h> // for sleep
 
 void hack_start(const char *game_data_dir) {
-    // 换成英文日志，防止乱码
-    __android_log_print(ANDROID_LOG_INFO, "Perfare", ">>> HACK START: Waiting for libfvctyud.so... <<<");
+    __android_log_print(ANDROID_LOG_INFO, "Perfare", ">>> HACK START: 正在蹲守 libfvctyud.so <<<");
 
     void *handle = nullptr;
     
-    // 循环等待，直到找到为止 (或者超时)
-    // 很多游戏可能需要 5-10 秒才会加载核心 so
+    // 1. 死循环等待加载 (正如之前验证有效的逻辑)
     while (true) {
-        // 尝试打开目标 SO
         handle = xdl_open("libfvctyud.so", 0);
-        
         if (handle) {
-            // 找到了！跳出循环
-            __android_log_print(ANDROID_LOG_INFO, "Perfare", "!!! FOUND IT !!! Handle: %p", handle);
+            __android_log_print(ANDROID_LOG_INFO, "Perfare", "!!! 捕获成功 (Handle: %p) !!!", handle);
             break;
         }
-
-        // 没找到，打印个点，继续等
-        // 为了防止刷屏太快，可以把这个日志注释掉，或者每5秒打一次
-        // __android_log_print(ANDROID_LOG_INFO, "Perfare", "Waiting..."); 
-        
-        sleep(1); // 等待 1 秒
+        sleep(1);
     }
 
-    // 拿到 Handle 后，初始化并 Dump
-    if (handle) {
-        __android_log_print(ANDROID_LOG_INFO, "Perfare", ">>> Initializing API... <<<");
-        il2cpp_api_init(handle);
-        
-        __android_log_print(ANDROID_LOG_INFO, "Perfare", ">>> Starting Dump... <<<");
-        il2cpp_dump(game_data_dir);
-        
-        __android_log_print(ANDROID_LOG_INFO, "Perfare", ">>> Dump Done! <<<");
+    // 2. 获取真正的内存基地址 (Base Address)
+    // 注意：handle 不等于基地址，必须用 xdl_info 查出来
+    xdl_info_t info;
+    void* base_addr = nullptr;
+    
+    if (xdl_info(handle, XDL_DI_DLINFO, &info)) {
+        base_addr = info.dli_fbase;
+        __android_log_print(ANDROID_LOG_INFO, "Perfare", ">>> 真身基地址 Base Address: %p <<<", base_addr);
     } else {
-        // 理论上死循环不会走到这里，除非你加了 break 条件
-        __android_log_print(ANDROID_LOG_INFO, "Perfare", "FATAL: Loop exited without handle");
+        __android_log_print(ANDROID_LOG_INFO, "Perfare", "FATAL: 无法获取基地址！");
+        return;
     }
+
+    // 3. 【在这里执行 Hook】
+    // 既然 API 都是空的，dump 肯定闪退，直接注释掉下面两行！
+    // il2cpp_api_init(handle); 
+    // il2cpp_dump(game_data_dir);
+
+    // -----------------------------------------------------------
+    // 你的 Hook 逻辑应该写在这里
+    // 假设你要 Hook 的偏移是 0x123456 (来自 dump.cs)
+    // -----------------------------------------------------------
+    
+    // uintptr_t target_offset = 0x123456; // 替换成你的真实偏移
+    // void* target_addr = (void*)((uintptr_t)base_addr + target_offset);
+    
+    // __android_log_print(ANDROID_LOG_INFO, "Perfare", "准备 Hook 地址: %p", target_addr);
+    
+    // DobbyHook(target_addr, (void*)new_func, (void**)&old_func); 
+    
+    __android_log_print(ANDROID_LOG_INFO, "Perfare", ">>> 任务完成，线程休眠防止退出 <<<");
+    while(true) sleep(100);
 }
 // -------------------------------------------------------------
 // 以下部分完全保持你提供的源码原样，一个字符都不动
