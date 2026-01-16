@@ -16,59 +16,48 @@
 #include <sys/mman.h>
 #include <linux/unistd.h>
 #include <array>
-#include <android/log.h> // 确保能用原生打印
+#include <android/log.h>
 
-// 简单粗暴的入口
+// -------------------------------------------------------------
+// 只修改了这里：尝试捕捉真身 libliapp.so
+// -------------------------------------------------------------
 void hack_start(const char *game_data_dir) {
-    // 1. 进来直接用原生打印，确保不被宏定义坑
-    __android_log_print(ANDROID_LOG_INFO, "Perfare", ">>> HACK START: 线程已启动，准备干活 <<<");
+    // 1. 先打印一句，确保逻辑恢复正常 (能看到这句说明环境没问题)
+    __android_log_print(ANDROID_LOG_INFO, "Perfare", ">>> HACK_START: 恢复正常逻辑，准备寻找基址 <<<");
 
     bool load = false;
-    
-    // 尝试 15 次，每次等待 1 秒
-    for (int i = 0; i < 15; i++) {
+    for (int i = 0; i < 20; i++) { // 稍微增加一点尝试次数到20秒
         
-        // ---------------------------------------------------------
-        // 尝试目标 1: libliapp.so (根据字符串猜测的真身)
-        // ---------------------------------------------------------
-        void *handle_liapp = xdl_open("libliapp.so", 0);
-        if (handle_liapp) {
-            __android_log_print(ANDROID_LOG_INFO, "Perfare", "!!! 捕获到 libliapp.so !!! 地址: %p", handle_liapp);
-            load = true;
-            il2cpp_api_init(handle_liapp); // 用这个句柄去初始化
-            il2cpp_dump(game_data_dir);
-            break;
+        // 【核心修改】优先尝试直接打开 libliapp.so
+        // 既然你在内存字符串里看见了它，xdl 很有可能直接拿到它的句柄
+        void *handle = xdl_open("libliapp.so", 0);
+        
+        // 如果找不到 liapp，才去找 il2cpp (兼容逻辑)
+        if (!handle) {
+            handle = xdl_open("libil2cpp.so", 0);
         }
 
-        // ---------------------------------------------------------
-        // 尝试目标 2: libil2cpp.so (原来的逻辑)
-        // ---------------------------------------------------------
-        void *handle_il2cpp = xdl_open("libil2cpp.so", 0);
-        if (handle_il2cpp) {
-             // 这里只打印，不 break，因为我们怀疑它是假的。
-             // 除非跑完15秒还没找到 liapp，否则先不急着 dump 这个
-             __android_log_print(ANDROID_LOG_INFO, "Perfare", "发现 libil2cpp.so (可能是壳) 地址: %p", handle_il2cpp);
-        }
-
-        sleep(1);
-    }
-
-    // 如果最后还是没找到 liapp，那就只能用 il2cpp 兜底了
-    if (!load) {
-        void *handle = xdl_open("libil2cpp.so", 0);
         if (handle) {
-            __android_log_print(ANDROID_LOG_INFO, "Perfare", ">>> 没办法了，只能用 libil2cpp.so 进行 Dump <<<");
+            load = true;
+            // 打印一下我们到底拿到了谁的句柄，这能帮我们确认是不是钩到了真身
+            __android_log_print(ANDROID_LOG_INFO, "Perfare", ">>> 成功获取基址 Handle: %p <<<", handle);
+            
             il2cpp_api_init(handle);
             il2cpp_dump(game_data_dir);
+            break;
         } else {
-            __android_log_print(ANDROID_LOG_INFO, "Perfare", "FATAL: 真的啥都没找到 thread %d", gettid());
+            sleep(1);
         }
+    }
+    
+    if (!load) {
+        LOGI("libil2cpp.so / libliapp.so not found in thread %d", gettid());
     }
 }
 
-// -----------------------------------------------------------
-// 下面的代码完全没动
-// -----------------------------------------------------------
+// -------------------------------------------------------------
+// 以下部分完全保持你提供的源码原样，一个字符都不动
+// -------------------------------------------------------------
 
 std::string GetLibDir(JavaVM *vms) {
     JNIEnv *env = nullptr;
