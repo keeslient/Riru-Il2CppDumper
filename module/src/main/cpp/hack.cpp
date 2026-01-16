@@ -8,24 +8,12 @@
 #include <thread>
 #include <sys/mman.h>
 #include <android/log.h>
-#include <fstream>
 #include <cstdlib>
 #include <vector>
 #include <iomanip>
 #include <sstream>
-#include <string>
-#include <array>
-#include <link.h>
-#include <sys/ptrace.h>
-#include <sys/wait.h>
-#include <sys/user.h>
-#include <sys/ioctl.h>
-#include <sys/syscall.h>
-#include <linux/perf_event.h>
-#include <linux/hw_breakpoint.h>
 #include <signal.h>
 #include <ucontext.h>
-#include <errno.h>
 
 #define LOG_TAG "Perfare"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -33,8 +21,9 @@
 // =============================================================
 // 全局变量
 // =============================================================
-int g_perf_fd = -1;
 uintptr_t g_target_addr = 0;
+uint32_t g_backup_instruction = 0; // 备份原始指令
+bool g_is_hooked = false;
 
 // Hex 转字符串
 std::string hexStr(unsigned char *data, int len) {
@@ -46,86 +35,92 @@ std::string hexStr(unsigned char *data, int len) {
 }
 
 // =============================================================
-// 信号处理 (中断发生时执行这里)
+// 信号处理 (捕获 SIGTRAP)
 // =============================================================
-void BreakpointHandler(int signum, siginfo_t *info, void *context) {
+void TrapHandler(int signum, siginfo_t *info, void *context) {
     ucontext_t *uc = (ucontext_t *)context;
     
-    // 获取当前指令地址 (PC)
+    // 获取 PC 指针
     #if defined(__aarch64__)
     uintptr_t pc = uc->uc_mcontext.pc;
-    // 参数1 (this) = x0, 参数2 (packet) = x1
-    uintptr_t arg1_packet = uc->uc_mcontext.regs[1]; 
-    #elif defined(__arm__)
-    uintptr_t pc = uc->uc_mcontext.arm_pc;
-    uintptr_t arg1_packet = uc->uc_mcontext.arm_r1;
+    uintptr_t arg1_packet = uc->uc_mcontext.regs[1]; // x1 = packet
     #else
-    uintptr_t pc = 0;
-    uintptr_t arg1_packet = 0;
+    return; // 不支持 32 位
     #endif
 
-    // 判断是否命中目标
+    // 也就是我们下断点的地方
     if (pc == g_target_addr) {
-        LOGI(">>> [硬件断点命中] PC: %p <<<", (void*)pc);
+        LOGI(">>> [软件断点命中] 成功拦截! <<<");
         
         if (arg1_packet != 0) {
-            // 打印数据！(尝试读取前 64 字节)
-            // 这里的强转读取有一定风险，如果崩溃请加内存检查逻辑
-            unsigned char* ptr = (unsigned char*)arg1_packet;
-            LOGI("Packet Addr: %p", ptr);
-            LOGI("Data: %s", hexStr(ptr, 64).c_str());
+            // 打印数据!
+            LOGI("Packet Addr: %p", (void*)arg1_packet);
+            LOGI("Data: %s", hexStr((unsigned char*)arg1_packet, 128).c_str());
+        } else {
+            LOGI("Packet Addr is NULL");
         }
 
-        // 关键：命中一次后必须禁用，否则会死循环卡死在这里
-        // 如果想持续抓包，需要实现单步调试(Single Step)机制，比较复杂
-        // 这里为了演示成功，先禁用断点，让游戏继续运行
-        if (g_perf_fd != -1) {
-            ioctl(g_perf_fd, PERF_EVENT_IOC_DISABLE, 0);
-            LOGI(">>> 断点已临时禁用，防止死循环 (单次抓取成功) <<<");
-        }
+        // =================================================
+        // 关键步骤：还原代码，让游戏继续运行
+        // =================================================
+        
+        // 1. 修改内存权限为可写
+        void *page_start = (void *)(g_target_addr & ~(getpagesize() - 1));
+        mprotect(page_start, getpagesize(), PROT_READ | PROT_WRITE | PROT_EXEC);
+
+        // 2. 还原原始指令 (把 BRK 改回原来的指令)
+        *(uint32_t*)g_target_addr = g_backup_instruction;
+
+        // 3. 刷新指令缓存 (必须做，否则 CPU 可能还记得旧指令)
+        __builtin___clear_cache((char*)g_target_addr, (char*)g_target_addr + 4);
+
+        LOGI(">>> 指令已还原，放行游戏 (One-Shot Hook) <<<");
+        
+        // 注意：这种简易写法只能抓到“第一次”发包。
+        // 因为指令还原后，断点就没了。
+        // 如果想一直抓，需要“单步调试”机制，代码量太大，先确保能抓到这一条！
     }
 }
 
 // =============================================================
-// 设置硬件断点 (perf_event_open)
+// 安装软件断点
 // =============================================================
-void SetupHWBP(uintptr_t addr) {
-    struct perf_event_attr pe;
-    memset(&pe, 0, sizeof(struct perf_event_attr));
-    
-    pe.type = PERF_TYPE_BREAKPOINT;
-    pe.size = sizeof(struct perf_event_attr);
-    pe.bp_type = HW_BREAKPOINT_X; // 监控执行 (Execute)
-    pe.bp_addr = addr;
-    pe.bp_len = sizeof(long);
-    pe.disabled = 1; // 初始关闭
-    pe.exclude_kernel = 1;
-    pe.exclude_hv = 1;
+void InstallSoftwareBreakpoint(uintptr_t addr) {
+    if (g_is_hooked) return;
 
-    // 为当前线程设置断点
-    // 注意：硬件断点是线程级的！如果游戏逻辑不在这个线程，可能抓不到。
-    // 但 Zygisk 注入通常有机会在主线程环境执行。
-    g_perf_fd = syscall(__NR_perf_event_open, &pe, 0, -1, -1, 0);
+    // 1. 计算页对齐地址
+    void *page_start = (void *)(addr & ~(getpagesize() - 1));
     
-    if (g_perf_fd == -1) {
-        LOGI("硬件断点创建失败: %s (Errno: %d)", strerror(errno), errno);
+    // 2. 修改权限：允许读、写、执行
+    if (mprotect(page_start, getpagesize(), PROT_READ | PROT_WRITE | PROT_EXEC) == -1) {
+        LOGI("mprotect 失败，无法修改内存权限!");
         return;
     }
 
-    // 注册信号处理函数
+    // 3. 备份原始指令
+    g_backup_instruction = *(uint32_t*)addr;
+    LOGI("备份原始指令: %08x", g_backup_instruction);
+
+    // 4. 写入 BRK #0 指令 (Hex: D4200000)
+    // 当 CPU 执行到这条指令时，会抛出 SIGTRAP 信号
+    *(uint32_t*)addr = 0xD4200000;
+    
+    // 5. 刷新缓存
+    __builtin___clear_cache((char*)addr, (char*)addr + 4);
+
+    // 6. 注册信号处理函数
     struct sigaction sa;
     memset(&sa, 0, sizeof(struct sigaction));
-    sa.sa_sigaction = BreakpointHandler;
-    sa.sa_flags = SA_SIGINFO | SA_NODEFER; // SA_NODEFER 允许在处理函数内再次触发信号
+    sa.sa_sigaction = TrapHandler;
+    sa.sa_flags = SA_SIGINFO;
     sigaction(SIGTRAP, &sa, NULL);
 
-    // 启用断点
-    ioctl(g_perf_fd, PERF_EVENT_IOC_ENABLE, 0);
-    LOGI(">>> 硬件断点已激活，目标: %p (FD: %d) <<<", (void*)addr, g_perf_fd);
+    g_is_hooked = true;
+    LOGI(">>> 软件断点已写入: %p (BRK 指令) <<<", (void*)addr);
 }
 
 // =============================================================
-// 寻找基址逻辑 (90MB大文件策略)
+// 寻找基址逻辑 (保持不变)
 // =============================================================
 void* FindRealIl2CppBase() {
     FILE *fp = fopen("/proc/self/maps", "r");
@@ -139,7 +134,6 @@ void* FindRealIl2CppBase() {
             unsigned long start, end;
             if (sscanf(line, "%lx-%lx", &start, &end) == 2) {
                 unsigned long size = end - start;
-                // 大于 30MB
                 if (size > 1024 * 1024 * 30) { 
                     if (size > max_size) {
                         max_size = size;
@@ -157,11 +151,9 @@ void* FindRealIl2CppBase() {
 // 主逻辑
 // =============================================================
 void hack_start(const char *game_data_dir) {
-    LOGI(">>> HACK START: 纯净硬件断点模式 <<<");
+    LOGI(">>> HACK START: 软件断点模式 (无需系统权限) <<<");
 
     void* base_addr = nullptr;
-    
-    // 1. 找基址
     while (true) {
         base_addr = FindRealIl2CppBase();
         if (base_addr != nullptr) {
@@ -171,29 +163,21 @@ void hack_start(const char *game_data_dir) {
         sleep(1);
     }
 
-    // 2. 计算目标地址
-    // 你的 dump.cs 里的 PacketEncode 偏移
     uintptr_t offset_PacketEncode = 0x11b54c8; 
     g_target_addr = (uintptr_t)base_addr + offset_PacketEncode;
-    
-    LOGI(">>> 准备下断点: %p <<<", (void*)g_target_addr);
+    LOGI(">>> 目标地址: %p <<<", (void*)g_target_addr);
 
-    // 3. 验证一下是不是真的代码 (OpCode 验证)
+    // 验证 OpCode
     unsigned char* code = (unsigned char*)g_target_addr;
-    LOGI("OpCode Check: %02x %02x %02x %02x (应为 fb 6b bb a9)", code[0], code[1], code[2], code[3]);
+    LOGI("OpCode Check: %02x %02x %02x %02x", code[0], code[1], code[2], code[3]);
 
-    // 4. 设置硬件断点
-    // 警告：如果 hack_start 是在独立线程运行的，这里的断点可能抓不到主线程的游戏逻辑。
-    // 但这是“不加 Dobby”的唯一办法。如果抓不到，说明需要切线程，那个更麻烦。
-    // 先试这个！
-    SetupHWBP(g_target_addr);
+    // 安装断点
+    InstallSoftwareBreakpoint(g_target_addr);
 
     while(true) sleep(10);
 }
 
-// -----------------------------------------------------------
 // 模板代码 (保持不变)
-// -----------------------------------------------------------
 std::string GetLibDir(JavaVM *vms) { return ""; }
 static std::string GetNativeBridgeLibrary() { return ""; }
 bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size_t length) { return false; }
