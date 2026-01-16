@@ -16,84 +16,58 @@
 #include <sys/mman.h>
 #include <linux/unistd.h>
 #include <array>
-// 【新增】我们需要这个头文件来遍历内存模块
-#include <link.h>
+#include <android/log.h> // 确保能用原生打印
 
-// 【新增】回调函数：打印当前加载的所有模块
-// 这样我们就能在 Logcat 里看到到底有哪些 SO 被加载了，以及它们的真实地址
-static int print_libs_callback(struct dl_phdr_info* info, size_t size, void* data) {
-    // 过滤一下，只显示我们关心的（包含 com. 或者 data 路径，或者名字里带 il2cpp/liapp 的）
-    if (info->dlpi_name && (
-            strstr(info->dlpi_name, "com.") || 
-            strstr(info->dlpi_name, "/data/") || 
-            strstr(info->dlpi_name, "il2cpp") || 
-            strstr(info->dlpi_name, "liapp") || 
-            strstr(info->dlpi_name, "unity"))) {
-        
-        LOGI("[🔍 发现模块] Name: %s | Base Address: %p", 
-             (strlen(info->dlpi_name) > 0 ? info->dlpi_name : "可能是匿名段(Anonymous)"), 
-             (void*)info->dlpi_addr);
-    }
-    return 0;
-}
-
+// 简单粗暴的入口
 void hack_start(const char *game_data_dir) {
-    // 1. 一上来先吼一声，证明代码跑起来了
-    LOGI(">>> HACK START: 正在扫描内存模块... <<<");
-    
-    // 2. 打印所有模块，请在日志里搜 "发现模块"
-    dl_iterate_phdr(print_libs_callback, nullptr);
-    LOGI(">>> 扫描结束，开始寻找目标 SO <<<");
+    // 1. 进来直接用原生打印，确保不被宏定义坑
+    __android_log_print(ANDROID_LOG_INFO, "Perfare", ">>> HACK START: 线程已启动，准备干活 <<<");
 
     bool load = false;
-    void *handle = nullptr;
-
-    // 3. 循环寻找目标，优先找 libliapp.so
-    for (int i = 0; i < 15; i++) { // 多试几次，给它点加载时间
+    
+    // 尝试 15 次，每次等待 1 秒
+    for (int i = 0; i < 15; i++) {
         
-        // --- 尝试 A: 找 libliapp.so ---
-        handle = xdl_open("libliapp.so", 0);
-        if (handle) {
-            LOGI("!!! 成功定位到 libliapp.so !!! Base: %p", handle);
+        // ---------------------------------------------------------
+        // 尝试目标 1: libliapp.so (根据字符串猜测的真身)
+        // ---------------------------------------------------------
+        void *handle_liapp = xdl_open("libliapp.so", 0);
+        if (handle_liapp) {
+            __android_log_print(ANDROID_LOG_INFO, "Perfare", "!!! 捕获到 libliapp.so !!! 地址: %p", handle_liapp);
             load = true;
-            // 找到真身后，直接开始 Dump
-            il2cpp_api_init(handle);
+            il2cpp_api_init(handle_liapp); // 用这个句柄去初始化
             il2cpp_dump(game_data_dir);
             break;
         }
 
-        // --- 尝试 B: 找 libil2cpp.so (保底) ---
-        // 如果这里打印出来了，说明至少找到了诱饵
-        void* temp_handle = xdl_open("libil2cpp.so", 0);
-        if (temp_handle) {
-             LOGI(">>> 发现 libil2cpp.so (可能是壳) Base: %p", temp_handle);
-             // 先不急着 break，继续循环看看能不能等到 liapp 出现
-             // 如果你确定只要 il2cpp，可以把下面两行注释解开
-             // handle = temp_handle;
-             // load = true; break;
+        // ---------------------------------------------------------
+        // 尝试目标 2: libil2cpp.so (原来的逻辑)
+        // ---------------------------------------------------------
+        void *handle_il2cpp = xdl_open("libil2cpp.so", 0);
+        if (handle_il2cpp) {
+             // 这里只打印，不 break，因为我们怀疑它是假的。
+             // 除非跑完15秒还没找到 liapp，否则先不急着 dump 这个
+             __android_log_print(ANDROID_LOG_INFO, "Perfare", "发现 libil2cpp.so (可能是壳) 地址: %p", handle_il2cpp);
         }
 
         sleep(1);
     }
-    
-    // 如果最后还是没找到 liapp，但找到了 il2cpp，那就用 il2cpp 兜底
-    if (!load && !handle) {
-        handle = xdl_open("libil2cpp.so", 0);
+
+    // 如果最后还是没找到 liapp，那就只能用 il2cpp 兜底了
+    if (!load) {
+        void *handle = xdl_open("libil2cpp.so", 0);
         if (handle) {
-            LOGI(">>> 最终回退使用 libil2cpp.so <<<");
-            load = true;
+            __android_log_print(ANDROID_LOG_INFO, "Perfare", ">>> 没办法了，只能用 libil2cpp.so 进行 Dump <<<");
             il2cpp_api_init(handle);
             il2cpp_dump(game_data_dir);
+        } else {
+            __android_log_print(ANDROID_LOG_INFO, "Perfare", "FATAL: 真的啥都没找到 thread %d", gettid());
         }
-    }
-
-    if (!load) {
-        LOGI("FATAL: 真的找不到了 (Target SO not found) thread %d", gettid());
     }
 }
 
 // -----------------------------------------------------------
-// 以下代码未修改，保持原样
+// 下面的代码完全没动
 // -----------------------------------------------------------
 
 std::string GetLibDir(JavaVM *vms) {
