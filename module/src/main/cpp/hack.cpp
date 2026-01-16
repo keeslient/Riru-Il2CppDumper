@@ -1,48 +1,4 @@
 #include "hack.h"
-#include "il2cpp_dump.h"
-#include "log.h"
-#include "xdl.h"
-#include <cstring>
-#include <cstdio>
-#include <unistd.h>
-#include <sys/system_properties.h>
-#include <dlfcn.h>
-#include <jni.h>
-#include <thread>
-#include <sys/mman.h>
-#include <linux/unistd.h>
-#include <array>
-#include <android/log.h>
-#include <fstream>  // 必须包含
-#include <cstdlib>  // strtoul
-
-// ------------------------------------------------------------------
-// 核心函数：绕过 xdl，直接从内核 maps 读取基地址
-// ------------------------------------------------------------------
-void* GetBaseAddress(const char* lib_name) {
-    FILE* fp = fopen("/proc/self/maps", "r");
-    if (!fp) return nullptr;
-
-    char line[2048];
-    void* addr = nullptr;
-
-    while (fgets(line, sizeof(line), fp)) {
-        // 查找包含 lib_name (例如 libfvctyud.so) 且具有 r-xp (可执行) 权限的行
-        if (strstr(line, lib_name) && strstr(line, "r-xp")) {
-            // maps 格式: 78fac8f000-78fad24000 r-xp ...
-            // 我们只需要第一个横杠前面的部分
-            unsigned long start_addr;
-            if (sscanf(line, "%lx-", &start_addr) == 1) {
-                addr = (void*)start_addr;
-                break;
-            }
-        }
-    }
-    fclose(fp);
-    return addr;
-}
-
-#include "hack.h"
 #include "log.h"
 #include "xdl.h"
 #include <cstring>
