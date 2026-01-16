@@ -1,7 +1,6 @@
 #include "hack.h"
 #include "log.h"
-#include "xdl.h"
-#include "dobby.h" // 配合 FetchContent 自动下载的源码
+#include "xdl.h" 
 #include <cstring>
 #include <cstdio>
 #include <unistd.h>
@@ -10,18 +9,25 @@
 #include <thread>
 #include <sys/mman.h>
 #include <android/log.h>
-#include <fstream>
 #include <cstdlib>
 #include <vector>
 #include <iomanip>
 #include <sstream>
+#include <signal.h>
+#include <ucontext.h>
 
 #define LOG_TAG "Perfare"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
 // =============================================================
-// 工具函数：Hex 转 String
+// 全局状态
 // =============================================================
+uintptr_t g_target_addr = 0;
+uint32_t g_backup_instruction = 0;
+// 标记当前断点是否处于激活状态
+volatile bool g_breakpoint_active = false; 
+
+// Hex 转 String
 std::string hexStr(unsigned char *data, int len) {
     std::stringstream ss;
     ss << std::hex;
@@ -31,54 +37,88 @@ std::string hexStr(unsigned char *data, int len) {
 }
 
 // =============================================================
-// Dobby Hook 逻辑
+// 信号处理器 (抓包逻辑)
 // =============================================================
+void TrapHandler(int signum, siginfo_t *info, void *context) {
+    #if defined(__aarch64__)
+    ucontext_t *uc = (ucontext_t *)context;
+    uintptr_t pc = uc->uc_mcontext.pc;
+    uintptr_t x1_packet = uc->uc_mcontext.regs[1]; // x1 = Packet对象
 
-// 定义原始函数指针
-void (*old_PacketEncode)(void* instance, void* packet, bool flag);
-
-// 我们的新函数
-void new_PacketEncode(void* instance, void* packet, bool flag) {
-    
-    // 只在 packet 有效时才干活
-    if (packet != nullptr) {
+    // 只有在断点激活且地址匹配时才处理
+    if (pc == g_target_addr && g_breakpoint_active) {
         
-        // 【防卡顿机制】每 20 次调用只打印 1 次 (防止刷屏卡死)
-        // 如果发现漏包严重，可以把 20 改成 1，或者 5
-        static int counter = 0;
-        if (counter++ % 20 == 0) {
+        // --- 抓包逻辑 ---
+        if (x1_packet != 0) {
+            // 读取 Packet -> Buffer (0x10) -> Data (0x20)
+            // 注意：这里要做指针检查，防止崩溃
+            uintptr_t buffer_obj = 0;
+            // 简单防崩：检查指针是否在用户空间合理范围
+            if (x1_packet > 0x100000) {
+                 buffer_obj = *(uintptr_t*)(x1_packet + 0x10);
+            }
             
-            // --- 仅在 64 位下执行解包逻辑 (防止 32 位编译报错) ---
-            #if defined(__aarch64__)
-            
-                // 1. 获取 Packet 内部的 Buffer 指针 (根据你断点观测到的偏移 0x10)
-                // C# 对象头通常是 16 字节，字段从 0x10 开始
-                uintptr_t buffer_obj_addr = *(uintptr_t*)((uintptr_t)packet + 0x10);
-                
-                if (buffer_obj_addr != 0) {
-                    // 2. 获取 Buffer 对象里的实际字节数组 (通常在 0x20)
-                    // C# 数组结构: [Header] [Length] [Data]
-                    // Data 开始的位置通常是 0x20
-                    unsigned char* raw_data = (unsigned char*)(buffer_obj_addr + 0x20);
-                    
-                    // 3. 简单的内存有效性检查 (防止野指针崩溃)
-                    // 如果地址太小(比如 0x0 - 0x10000)，说明肯定不是堆内存
-                    if ((uintptr_t)raw_data > 0x100000) {
-                        // 打印前 128 字节数据
-                        LOGI(">>> [Dobby抓包] Data: %s", hexStr(raw_data, 128).c_str());
-                    }
-                }
-                
-            #endif
+            if (buffer_obj > 0x100000) {
+                unsigned char* raw_data = (unsigned char*)(buffer_obj + 0x20);
+                // 打印前 64 字节
+                LOGI(">>> [采样抓包] Data: %s", hexStr(raw_data, 64).c_str());
+            } else {
+                // 如果解包失败，至少打印个对象地址证明抓到了
+                LOGI(">>> [采样抓包] 捕获对象: %p (Buffer为空)", (void*)x1_packet);
+            }
         }
-    }
 
-    // 【必须】调用原函数，否则游戏断网或逻辑中断
-    if(old_PacketEncode) old_PacketEncode(instance, packet, flag);
+        // --- 还原代码 (放行游戏) ---
+        // 1. 修改权限
+        void *page_start = (void *)(g_target_addr & ~(getpagesize() - 1));
+        mprotect(page_start, getpagesize(), PROT_READ | PROT_WRITE | PROT_EXEC);
+        
+        // 2. 写回原始指令
+        *(uint32_t*)g_target_addr = g_backup_instruction;
+        
+        // 3. 刷新缓存
+        __builtin___clear_cache((char*)g_target_addr, (char*)g_target_addr + 4);
+        
+        // 4. 标记断点已失效
+        g_breakpoint_active = false;
+        
+        // LOGI(">>> 拦截结束，游戏恢复流畅运行 <<<");
+    }
+    #endif
 }
 
 // =============================================================
-// 寻找基址逻辑 (90MB 策略)
+// 安装断点
+// =============================================================
+void InstallTrap() {
+    if (g_target_addr == 0) return;
+    
+    // 如果已经在激活状态，就别重复写了
+    if (g_breakpoint_active) return;
+
+    void *page_start = (void *)(g_target_addr & ~(getpagesize() - 1));
+    if (mprotect(page_start, getpagesize(), PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+        
+        // 第一次安装时备份指令
+        if (g_backup_instruction == 0) {
+             g_backup_instruction = *(uint32_t*)g_target_addr;
+             LOGI("备份原始指令: %08x", g_backup_instruction);
+        }
+
+        // 写入 BRK 指令 (AArch64)
+        #if defined(__aarch64__)
+        *(uint32_t*)g_target_addr = 0xD4200000;
+        #endif
+
+        __builtin___clear_cache((char*)g_target_addr, (char*)g_target_addr + 4);
+        
+        g_breakpoint_active = true;
+        // LOGI(">>> 陷阱已布设，等待猎物... <<<");
+    }
+}
+
+// =============================================================
+// 寻找基址
 // =============================================================
 void* FindRealIl2CppBase() {
     FILE *fp = fopen("/proc/self/maps", "r");
@@ -92,7 +132,6 @@ void* FindRealIl2CppBase() {
             unsigned long start, end;
             if (sscanf(line, "%lx-%lx", &start, &end) == 2) {
                 unsigned long size = end - start;
-                // 30MB 阈值
                 if (size > 1024 * 1024 * 30) { 
                     if (size > max_size) {
                         max_size = size;
@@ -107,49 +146,43 @@ void* FindRealIl2CppBase() {
 }
 
 // =============================================================
-// 主线程逻辑
+// 主逻辑
 // =============================================================
 void hack_start(const char *game_data_dir) {
-    LOGI(">>> HACK START: Dobby 完美适配版 <<<");
+    LOGI(">>> HACK START: 纯代码采样模式 (无任何依赖) <<<");
 
+    // 1. 注册信号处理 (一次即可)
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(struct sigaction));
+    sa.sa_sigaction = TrapHandler;
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER; 
+    sigaction(SIGTRAP, &sa, NULL);
+
+    // 2. 找地址
     void* base_addr = nullptr;
-    while (true) {
+    while (base_addr == nullptr) {
         base_addr = FindRealIl2CppBase();
-        if (base_addr != nullptr) {
-            LOGI("!!! 锁定真身 !!! Base Address: %p", base_addr);
-            break;
-        }
         sleep(1);
     }
-
-    // 偏移量
-    uintptr_t offset_PacketEncode = 0x11b54c8; 
-    void* target_addr = (void*)((uintptr_t)base_addr + offset_PacketEncode);
     
-    // --- 验证 OpCode (仅限 64 位) ---
-    #if defined(__aarch64__)
-        unsigned char* code = (unsigned char*)target_addr;
-        // 打印前 4 字节，让你确认是不是 fb 6b bb a9
-        LOGI("OpCode Check: %02x %02x %02x %02x", code[0], code[1], code[2], code[3]);
-    #endif
+    // 你的偏移
+    g_target_addr = (uintptr_t)base_addr + 0x11b54c8;
+    LOGI(">>> 目标锁定: %p <<<", (void*)g_target_addr);
 
-    // --- 执行 Dobby Hook ---
-    // DobbyHook 会自动处理内存属性修改、指令替换等复杂操作
-    int ret = DobbyHook(target_addr, (void*)new_PacketEncode, (void**)&old_PacketEncode);
-    
-    if (ret == 0) {
-        LOGI(">>> DobbyHook 成功！Hook 已激活！ <<<");
-    } else {
-        LOGI(">>> DobbyHook 失败: %d (请检查日志) <<<", ret);
+    // 3. 循环采样 (核心机制)
+    while (true) {
+        // 尝试下断点
+        InstallTrap();
+        
+        // 休息 2 秒
+        // 在这 2 秒内：
+        // A. 如果游戏没发包 -> 断点一直留着，等待下一秒
+        // B. 如果游戏发包了 -> 触发中断 -> 打印数据 -> 断点消失 -> 游戏流畅运行
+        sleep(2); 
     }
-
-    // 保持线程存活
-    while(true) sleep(10);
 }
 
-// =============================================================
-// 模板导出代码 (勿动)
-// =============================================================
+// 模板代码
 std::string GetLibDir(JavaVM *vms) { return ""; }
 static std::string GetNativeBridgeLibrary() { return ""; }
 bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size_t length) { return false; }
