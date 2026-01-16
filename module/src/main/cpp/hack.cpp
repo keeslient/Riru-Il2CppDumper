@@ -20,14 +20,13 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
 // =============================================================
-// 全局状态
+// 全局变量
 // =============================================================
 uintptr_t g_target_addr = 0;
 uint32_t g_backup_instruction = 0;
-// 标记当前断点是否处于激活状态
-volatile bool g_breakpoint_active = false; 
+volatile bool g_is_hook_active = false; // 标记当前是否下了钩子
 
-// Hex 转 String
+// Hex 工具
 std::string hexStr(unsigned char *data, int len) {
     std::stringstream ss;
     ss << std::hex;
@@ -37,84 +36,55 @@ std::string hexStr(unsigned char *data, int len) {
 }
 
 // =============================================================
-// 信号处理器 (抓包逻辑)
+// 信号处理器 (极速版 - 拒绝死锁)
 // =============================================================
 void TrapHandler(int signum, siginfo_t *info, void *context) {
     #if defined(__aarch64__)
     ucontext_t *uc = (ucontext_t *)context;
     uintptr_t pc = uc->uc_mcontext.pc;
-    uintptr_t x1_packet = uc->uc_mcontext.regs[1]; // x1 = Packet对象
-
-    // 只有在断点激活且地址匹配时才处理
-    if (pc == g_target_addr && g_breakpoint_active) {
+    
+    // 只有地址匹配才处理
+    if (pc == g_target_addr) {
         
-        // --- 抓包逻辑 ---
-        if (x1_packet != 0) {
-            // 读取 Packet -> Buffer (0x10) -> Data (0x20)
-            // 注意：这里要做指针检查，防止崩溃
-            uintptr_t buffer_obj = 0;
-            // 简单防崩：检查指针是否在用户空间合理范围
-            if (x1_packet > 0x100000) {
-                 buffer_obj = *(uintptr_t*)(x1_packet + 0x10);
-            }
-            
-            if (buffer_obj > 0x100000) {
-                unsigned char* raw_data = (unsigned char*)(buffer_obj + 0x20);
-                // 打印前 64 字节
-                LOGI(">>> [采样抓包] Data: %s", hexStr(raw_data, 64).c_str());
-            } else {
-                // 如果解包失败，至少打印个对象地址证明抓到了
-                LOGI(">>> [采样抓包] 捕获对象: %p (Buffer为空)", (void*)x1_packet);
-            }
+        // 1. 获取数据 (参数2 = x1)
+        uintptr_t x1_packet = uc->uc_mcontext.regs[1];
+        
+        // 打印 (放在这里虽然理论上有风险，但通常没事，比 mprotect 安全得多)
+        if (x1_packet > 0x10000) {
+             // 尝试解包: Packet(x1) -> Buffer(+0x10) -> Data(+0x20)
+             uintptr_t buffer_ptr = *(uintptr_t*)(x1_packet + 0x10);
+             if (buffer_ptr > 0x10000) {
+                 unsigned char* data = (unsigned char*)(buffer_ptr + 0x20);
+                 LOGI(">>> [Data] %s", hexStr(data, 64).c_str());
+             }
         }
 
-        // --- 还原代码 (放行游戏) ---
-        // 1. 修改权限
-        void *page_start = (void *)(g_target_addr & ~(getpagesize() - 1));
-        mprotect(page_start, getpagesize(), PROT_READ | PROT_WRITE | PROT_EXEC);
-        
-        // 2. 写回原始指令
+        // 2. 还原指令 (最关键的一步)
+        // 直接写内存，不调用 mprotect！
         *(uint32_t*)g_target_addr = g_backup_instruction;
-        
-        // 3. 刷新缓存
+
+        // 3. 刷新 CPU 缓存
         __builtin___clear_cache((char*)g_target_addr, (char*)g_target_addr + 4);
         
-        // 4. 标记断点已失效
-        g_breakpoint_active = false;
-        
-        // LOGI(">>> 拦截结束，游戏恢复流畅运行 <<<");
+        // 4. 标记失效，通知主线程一会再来补钩子
+        g_is_hook_active = false;
     }
     #endif
 }
 
 // =============================================================
-// 安装断点
+// 激活钩子
 // =============================================================
-void InstallTrap() {
-    if (g_target_addr == 0) return;
-    
-    // 如果已经在激活状态，就别重复写了
-    if (g_breakpoint_active) return;
+void ActivateHook() {
+    if (g_target_addr == 0 || g_is_hook_active) return;
 
-    void *page_start = (void *)(g_target_addr & ~(getpagesize() - 1));
-    if (mprotect(page_start, getpagesize(), PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
-        
-        // 第一次安装时备份指令
-        if (g_backup_instruction == 0) {
-             g_backup_instruction = *(uint32_t*)g_target_addr;
-             LOGI("备份原始指令: %08x", g_backup_instruction);
-        }
+    // 写入中断指令 BRK #0
+    #if defined(__aarch64__)
+    *(uint32_t*)g_target_addr = 0xD4200000;
+    #endif
 
-        // 写入 BRK 指令 (AArch64)
-        #if defined(__aarch64__)
-        *(uint32_t*)g_target_addr = 0xD4200000;
-        #endif
-
-        __builtin___clear_cache((char*)g_target_addr, (char*)g_target_addr + 4);
-        
-        g_breakpoint_active = true;
-        // LOGI(">>> 陷阱已布设，等待猎物... <<<");
-    }
+    __builtin___clear_cache((char*)g_target_addr, (char*)g_target_addr + 4);
+    g_is_hook_active = true;
 }
 
 // =============================================================
@@ -146,12 +116,12 @@ void* FindRealIl2CppBase() {
 }
 
 // =============================================================
-// 主逻辑
+// 主线程
 // =============================================================
 void hack_start(const char *game_data_dir) {
-    LOGI(">>> HACK START: 纯代码采样模式 (无任何依赖) <<<");
+    LOGI(">>> HACK START: 极速采样版 (修复卡死) <<<");
 
-    // 1. 注册信号处理 (一次即可)
+    // 1. 注册信号
     struct sigaction sa;
     memset(&sa, 0, sizeof(struct sigaction));
     sa.sa_sigaction = TrapHandler;
@@ -165,20 +135,30 @@ void hack_start(const char *game_data_dir) {
         sleep(1);
     }
     
-    // 你的偏移
     g_target_addr = (uintptr_t)base_addr + 0x11b54c8;
     LOGI(">>> 目标锁定: %p <<<", (void*)g_target_addr);
 
-    // 3. 循环采样 (核心机制)
+    // 3. 【关键】一次性修改权限
+    // 提前把这块地变成“可写”，以后 TrapHandler 里就不用改了，防止死锁
+    void *page_start = (void *)(g_target_addr & ~(getpagesize() - 1));
+    mprotect(page_start, getpagesize(), PROT_READ | PROT_WRITE | PROT_EXEC);
+    
+    // 备份原始指令
+    g_backup_instruction = *(uint32_t*)g_target_addr;
+    LOGI(">>> 备份指令: %08x <<<", g_backup_instruction);
+
+    // 4. 循环下钩子
     while (true) {
-        // 尝试下断点
-        InstallTrap();
-        
-        // 休息 2 秒
-        // 在这 2 秒内：
-        // A. 如果游戏没发包 -> 断点一直留着，等待下一秒
-        // B. 如果游戏发包了 -> 触发中断 -> 打印数据 -> 断点消失 -> 游戏流畅运行
-        sleep(2); 
+        // 如果钩子被还原了(说明刚抓到了包)，休息 3 秒再下
+        // 这样保证游戏有 3 秒的完全流畅时间
+        if (!g_is_hook_active) {
+            sleep(3); 
+            ActivateHook();
+            // LOGI(">>> 钩子已重置 <<<");
+        } else {
+            // 如果钩子还在(说明没发包)，就等着
+            usleep(100000); // 0.1秒检查一次
+        }
     }
 }
 
