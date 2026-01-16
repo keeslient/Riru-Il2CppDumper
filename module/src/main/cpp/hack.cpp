@@ -42,42 +42,87 @@ void* GetBaseAddress(const char* lib_name) {
     return addr;
 }
 
+#include "hack.h"
+#include "log.h"
+#include "xdl.h"
+#include <cstring>
+#include <cstdio>
+#include <unistd.h>
+#include <dlfcn.h>
+#include <jni.h>
+#include <thread>
+#include <sys/mman.h>
+#include <android/log.h>
+#include <fstream>
+#include <cstdlib>
+#include <vector>
+#include <iomanip>
+#include <sstream>
+
+// ------------------------------------------------------------------
+// 直接从 maps 读取基地址 (专门找 libil2cpp.so)
+// ------------------------------------------------------------------
+void* GetIl2CppBase() {
+    FILE* fp = fopen("/proc/self/maps", "r");
+    if (!fp) return nullptr;
+
+    char line[2048];
+    void* addr = nullptr;
+
+    while (fgets(line, sizeof(line), fp)) {
+        // 只要行里包含 "libil2cpp.so" 且是可执行段 (r-xp)
+        if (strstr(line, "libil2cpp.so") && strstr(line, "r-xp")) {
+            unsigned long start_addr;
+            if (sscanf(line, "%lx-", &start_addr) == 1) {
+                addr = (void*)start_addr;
+                // 这里可以顺便打印一下找到的行，确认是不是那个大文件
+                __android_log_print(ANDROID_LOG_INFO, "Perfare", "Maps Found: %s", line);
+                break;
+            }
+        }
+    }
+    fclose(fp);
+    return addr;
+}
+
+// ------------------------------------------------------------------
+// 主逻辑
+// ------------------------------------------------------------------
 void hack_start(const char *game_data_dir) {
-    __android_log_print(ANDROID_LOG_INFO, "Perfare", ">>> HACK START: Waiting for libfvctyud.so via Maps... <<<");
+    __android_log_print(ANDROID_LOG_INFO, "Perfare", ">>> HACK START: 正在等待真正的 libil2cpp.so 加载... <<<");
 
     void* base_addr = nullptr;
     
-    // 1. 死循环等待，直到 maps 里出现这个库
+    // 死循环等待，LIAPP 解密需要时间，我们就在这等它解密完
     while (true) {
-        base_addr = GetBaseAddress("libfvctyud.so"); // 直接找这个名字
+        base_addr = GetIl2CppBase();
         
         if (base_addr != nullptr) {
-            __android_log_print(ANDROID_LOG_INFO, "Perfare", "!!! SUCCESS !!! Real Base Address: %p", base_addr);
+            __android_log_print(ANDROID_LOG_INFO, "Perfare", "!!! 捕获真身 !!! libil2cpp Base: %p", base_addr);
             break;
         }
         
-        // 没找到就睡 1 秒
         sleep(1);
     }
 
-    // 2. 拿到基址后，你需要做的 Hook 操作放这里
-    // 注意：不要再调 il2cpp_api_init 了，那个肯定崩。
+    // ---------------------------------------------------------
+    // 这里的偏移量一定要用你 dump.cs 里的！
+    // ---------------------------------------------------------
     
-    // 示例：打印一下验证偏移 (假设偏移是 0x123456)
-    // __android_log_print(ANDROID_LOG_INFO, "Perfare", "Target Func Addr: %p", (void*)((uintptr_t)base_addr + 0x123456));
+    // 例如 PacketEncode 的 RVA 是 0x11b54c8 (根据你之前的描述)
+    // 真实地址 = base_addr + 0x11b54c8
+    
+    // uintptr_t offset = 0x11b54c8; 
+    // void* target_addr = (void*)((uintptr_t)base_addr + offset);
+    
+    // __android_log_print(ANDROID_LOG_INFO, "Perfare", ">>> Hook 点已就绪: %p <<<", target_addr);
 
-    // ---------------------------------------------------------
-    // 你的业务代码 (Hook Dobby 等) 写在下面
-    // ---------------------------------------------------------
+    // 在这里执行 DobbyHook ...
     
-    
-    // ---------------------------------------------------------
-
-    __android_log_print(ANDROID_LOG_INFO, "Perfare", ">>> Hook Setup Done. Monitoring... <<<");
-    
-    // 保持线程存活
     while(true) sleep(10);
 }
+
+// 下面的 NativeBridgeLoad / JNI_OnLoad 保持原样...
 
 // ------------------------------------------------------------------
 // 下面的 NativeBridgeLoad 等保持原样，为了过编译我不删了
