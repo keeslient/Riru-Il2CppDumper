@@ -29,20 +29,28 @@
 static uintptr_t global_so_base = 0;
 static uintptr_t real_sbox_addr = 0; // 动态搜索到的真 S 盒
 
-// 内存嗅探辅助
+// --- 1. 内存嗅探辅助 (修复了 32 位编译报错) ---
 void safe_hex_dump(const char* label, uintptr_t addr, size_t len) {
+    // 兼容性修复：强制转为 64 位进行比较，或者根据架构区分
+#if defined(__aarch64__)
     if (addr < 0x10000000 || addr > 0x7fffffffff) return;
+#else
+    if (addr < 0x10000000) return; // 32位最大地址就在合法范围内，无需判断上限
+#endif
+
     unsigned char buf[64];
     // 尝试读取，如果地址非法可能会崩溃，所以仅在 trap 中使用较安全
-    memcpy(buf, (void*)addr, len > 32 ? 32 : len);
+    size_t copy_len = len > 32 ? 32 : len;
+    memcpy(buf, (void*)addr, copy_len);
+    
     char hex_out[128] = {0};
-    for(size_t i = 0; i < (len > 32 ? 32 : len); i++) {
+    for(size_t i = 0; i < copy_len; i++) {
         sprintf(hex_out + strlen(hex_out), "%02X ", buf[i]);
     }
     LOGI("[💎] %s (地址: %p) 内容: %s", label, (void*)addr, hex_out);
 }
 
-// --- 1. 信号处理函数 ---
+// --- 2. 信号处理函数 ---
 void sbox_trap_handler(int sig, siginfo_t *info, void *context) {
     auto* ctx = (ucontext_t*)context;
     
@@ -80,8 +88,8 @@ void sbox_trap_handler(int sig, siginfo_t *info, void *context) {
     }
 }
 
-// --- 2. 核心：全内存搜索 S 盒特征 ---
-// LIAPP 可能会在 Heap 动态生成 S 盒，静态地址往往是诱饵
+// --- 3. 核心：全内存搜索 S 盒特征 ---
+// 修复了 sscanf 类型不匹配导致的编译错误
 void scan_and_trap_real_sbox() {
     LOGI("[📡] 启动全内存 S-Box 猎杀...");
     
@@ -95,15 +103,19 @@ void scan_and_trap_real_sbox() {
     while (fgets(line, sizeof(line), fp)) {
         // 只扫描可读写 (rw-) 的段，这通常是 Heap 或 Stack，也是动态 S 盒藏身之处
         if (strstr(line, "rw-p")) {
-            uintptr_t start, end;
-            if (sscanf(line, "%lx-%lx", &start, &end) == 2) {
+            // 修复点：使用 unsigned long 来接收 %lx，兼容 32/64 位
+            unsigned long tmp_start, tmp_end;
+            if (sscanf(line, "%lx-%lx", &tmp_start, &tmp_end) == 2) {
+                uintptr_t start = (uintptr_t)tmp_start;
+                uintptr_t end = (uintptr_t)tmp_end;
+
                 // 过滤掉太小的段或系统段，提高效率
                 if (end - start < 4096) continue;
                 
                 // 暴力扫描该段
                 for (uintptr_t addr = start; addr < end - 16; addr += 4) {
-                    // 使用 mincore 或直接 try-catch 会更稳，但这里假设 maps 准确
                     // 简单检查前4字节
+                    // 注意：直接读取可能存在风险，但通常自己的 rw 段没事
                     if (*(uint32_t*)addr == sbox_sig) {
                         // 二次检查：检查第 16 个字节是否为 63 (S[0]=0x63, S[15] is different)
                         // S-Box: 63 7C 77 7B F2 6B 6F C5 ...
@@ -111,8 +123,6 @@ void scan_and_trap_real_sbox() {
                         if (p[4] == 0xF2 && p[5] == 0x6B) {
                             LOGI("[🔥] 发现疑似动态 S 盒！地址: %p", (void*)addr);
                             
-                            // 排除掉那个假的静态 S 盒 (如果你知道它的范围)
-                            // 布下陷阱
                             real_sbox_addr = addr;
                             
                             struct sigaction sa;
@@ -123,7 +133,7 @@ void scan_and_trap_real_sbox() {
                             
                             if (mprotect((void*)(real_sbox_addr & ~0xFFF), 4096, PROT_NONE) == 0) {
                                 LOGI("[🪤] 成功在动态 S 盒上布雷！等待触发...");
-                                fclose(fp); // 找到一个就收工，避免多重陷阱崩溃
+                                fclose(fp); // 找到一个就收工
                                 return;
                             }
                         }
@@ -136,20 +146,24 @@ void scan_and_trap_real_sbox() {
     LOGI("[❌] 内存扫描结束，未找到动态 S 盒。可能使用了硬件 AES 指令。");
 }
 
-// --- 3. 启动入口 ---
+// --- 4. 启动入口 ---
 void hack_start(const char *game_data_dir) {
     LOGI("[🚀] 动态猎杀版启动...");
     
-    // 先尝试获取核心库基址 (辅助定位)
+    // 先尝试获取核心库基址 (辅助定位，但不依赖它)
     for (int i = 0; i < 10; i++) {
         FILE* fp = fopen("/proc/self/maps", "r");
         if (fp) {
             char line[1024];
             while (fgets(line, sizeof(line), fp)) {
                 if (strstr(line, "libfvctyud.so")) { // 你的乱码 SO 名
-                    global_so_base = strtoull(line, nullptr, 16);
-                    LOGI("[ℹ️] 核心库基址: %p", (void*)global_so_base);
-                    break;
+                    // 同样使用 unsigned long 兼容读取
+                    unsigned long tmp_base;
+                    if (sscanf(line, "%lx-", &tmp_base) == 1) {
+                         global_so_base = (uintptr_t)tmp_base;
+                         LOGI("[ℹ️] 核心库基址: %p", (void*)global_so_base);
+                         break;
+                    }
                 }
             }
             fclose(fp);
@@ -170,7 +184,7 @@ void hack_start(const char *game_data_dir) {
     }
 }
 
-// --- 4. 修复链接错误的 Zygisk 接口 ---
+// --- 5. 修复链接错误的 Zygisk 接口 ---
 void hack_prepare(const char *game_data_dir, void *data, size_t length) {
     LOGI("[🔗] Zygisk 调用 hack_prepare...");
     std::string path = game_data_dir ? game_data_dir : "";
