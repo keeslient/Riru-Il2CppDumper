@@ -159,42 +159,41 @@ struct NativeBridgeCallbacks {
 // 官方原版 hack_start
 void hack_start(const char *game_data_dir) {
     LOGI("[🚀] 整合版注入成功，等待 libil2cpp...");
-    bool load = false;
+    bool trap_done = false;
+
     for (int i = 0; i < 60; i++) {
-        // 1. 先尝试捕获乱码 SO 并布阵
         FILE* fp = fopen("/proc/self/maps", "r");
         if (fp) {
             char line[1024];
             while (fgets(line, sizeof(line), fp)) {
-                if (strstr(line, ".so") && strstr(line, "/data/app") && 
-                    !strstr(line, "libmain.so") && !strstr(line, "libunity.so") && 
-                    !strstr(line, "libil2cpp.so")) {
-                    
+                // 修改点：精准锁定 libfvctyud.so (或者你确定的乱码名)
+                // 只有名字匹配时才布阵，布完阵立刻把 trap_done 设为 true
+                if (!trap_done && strstr(line, "libfvctyud.so") && strstr(line, "/data/app")) {
                     char* so_path = strchr(line, '/');
                     char* so_name = strrchr(so_path, '/');
                     if (so_name) {
                         so_name++;
                         so_name[strcspn(so_name, "\n")] = 0;
+                        
+                        // 只针对这个核心库布阵
                         dump_and_trap(so_name, game_data_dir);
+                        trap_done = true; // 标记已完成，不再对其他 SO 布阵
+                        LOGI("[🔥] 目标锁定，陷阱已布下，停止扫描其他库。");
                     }
                 }
             }
             fclose(fp);
         }
 
-        // 2. 检查 il2cpp (官方原有 Dumper 逻辑)
+        // 检查 il2cpp 是否加载，加载了就说明游戏进入主逻辑了
         void *handle = xdl_open("libil2cpp.so", 0);
         if (handle) {
-            load = true;
             il2cpp_api_init(handle);
             il2cpp_dump(game_data_dir);
-            break;
-        } else {
-            sleep(2);
+            // 如果陷阱还没布下，这里可以做最后的兜底，但通常上面已经完成了
+            break; 
         }
-    }
-    if (!load) {
-        LOGI("libil2cpp.so not found in thread %d", gettid());
+        ::sleep(2);
     }
 }
 
