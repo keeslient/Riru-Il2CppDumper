@@ -1,6 +1,7 @@
 #include "hack.h"
 #include "log.h"
-#include "xdl.h" 
+#include "xdl.h"
+#include "dobby.h" // 配合 FetchContent 自动下载的源码
 #include <cstring>
 #include <cstdio>
 #include <unistd.h>
@@ -14,20 +15,13 @@
 #include <vector>
 #include <iomanip>
 #include <sstream>
-#include <signal.h>
-#include <ucontext.h>
 
 #define LOG_TAG "Perfare"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
 // =============================================================
-// 全局变量
+// 工具函数：Hex 转 String
 // =============================================================
-uintptr_t g_target_addr = 0;
-uint32_t g_backup_instruction = 0; // 用来存原始指令 (fb 6b bb a9)
-bool g_trap_triggered = false;
-
-// Hex 转字符串工具
 std::string hexStr(unsigned char *data, int len) {
     std::stringstream ss;
     ss << std::hex;
@@ -37,94 +31,54 @@ std::string hexStr(unsigned char *data, int len) {
 }
 
 // =============================================================
-// 信号处理 (核心逻辑)
+// Dobby Hook 逻辑
 // =============================================================
-void TrapHandler(int signum, siginfo_t *info, void *context) {
-    #if defined(__aarch64__)
-    ucontext_t *uc = (ucontext_t *)context;
-    uintptr_t pc = uc->uc_mcontext.pc;
-    uintptr_t x1_packet = uc->uc_mcontext.regs[1]; // x1 = SendingPacket 对象
 
-    if (pc == g_target_addr) {
-        LOGI(">>> [软件断点命中] 抓到 Packet 对象! <<<");
+// 定义原始函数指针
+void (*old_PacketEncode)(void* instance, void* packet, bool flag);
+
+// 我们的新函数
+void new_PacketEncode(void* instance, void* packet, bool flag) {
+    
+    // 只在 packet 有效时才干活
+    if (packet != nullptr) {
         
-        if (x1_packet != 0) {
-            // 1. 打印 Packet 对象本身 (盒子)
-            // LOGI("Packet Obj: %p", (void*)x1_packet);
-
-            // 2. 【核心修改】尝试读取里面的 Buffer
-            // 在 64位 Unity 中，第一个字段通常在偏移 0x10
-            uintptr_t field_1_ptr = *(uintptr_t*)(x1_packet + 0x10);
+        // 【防卡顿机制】每 20 次调用只打印 1 次 (防止刷屏卡死)
+        // 如果发现漏包严重，可以把 20 改成 1，或者 5
+        static int counter = 0;
+        if (counter++ % 20 == 0) {
             
-            if (field_1_ptr != 0) {
-                LOGI(">>> 发现内部 Buffer 指针: %p <<<", (void*)field_1_ptr);
+            // --- 仅在 64 位下执行解包逻辑 (防止 32 位编译报错) ---
+            #if defined(__aarch64__)
+            
+                // 1. 获取 Packet 内部的 Buffer 指针 (根据你断点观测到的偏移 0x10)
+                // C# 对象头通常是 16 字节，字段从 0x10 开始
+                uintptr_t buffer_obj_addr = *(uintptr_t*)((uintptr_t)packet + 0x10);
                 
-                // 3. 读取 Buffer 的内容
-                // C# 数组结构: [Header 0x00-0x10] [Length 0x18] [Data 0x20...]
-                // 我们直接读偏移 0x20 处的数据，这就是真正的明文封包！
+                if (buffer_obj_addr != 0) {
+                    // 2. 获取 Buffer 对象里的实际字节数组 (通常在 0x20)
+                    // C# 数组结构: [Header] [Length] [Data]
+                    // Data 开始的位置通常是 0x20
+                    unsigned char* raw_data = (unsigned char*)(buffer_obj_addr + 0x20);
+                    
+                    // 3. 简单的内存有效性检查 (防止野指针崩溃)
+                    // 如果地址太小(比如 0x0 - 0x10000)，说明肯定不是堆内存
+                    if ((uintptr_t)raw_data > 0x100000) {
+                        // 打印前 128 字节数据
+                        LOGI(">>> [Dobby抓包] Data: %s", hexStr(raw_data, 128).c_str());
+                    }
+                }
                 
-                unsigned char* data_ptr = (unsigned char*)(field_1_ptr + 0x20);
-                
-                // 为了防止野指针崩溃，简单检查一下地址合法性(简略版)
-                // 这里直接打印，如果闪退说明偏移不对，但这通常是通用的
-                LOGI("=== 真实封包内容 (Hex) ===");
-                LOGI("%s", hexStr(data_ptr, 128).c_str()); 
-                LOGI("==========================");
-            } else {
-                LOGI("Buffer 指针为空，可能偏移量不是 0x10");
-            }
+            #endif
         }
-
-        // --- 下面是还原逻辑，保持不变 ---
-        void *page_start = (void *)(g_target_addr & ~(getpagesize() - 1));
-        mprotect(page_start, getpagesize(), PROT_READ | PROT_WRITE | PROT_EXEC);
-        *(uint32_t*)g_target_addr = g_backup_instruction;
-        __builtin___clear_cache((char*)g_target_addr, (char*)g_target_addr + 4);
-        g_trap_triggered = true;
-        LOGI(">>> 指令已还原，游戏继续 <<<");
     }
-    #endif
+
+    // 【必须】调用原函数，否则游戏断网或逻辑中断
+    if(old_PacketEncode) old_PacketEncode(instance, packet, flag);
 }
 
 // =============================================================
-// 安装软件断点 (写入 BRK)
-// =============================================================
-void InstallSoftwareBreakpoint(uintptr_t addr) {
-    if (g_trap_triggered) return;
-
-    // 1. 计算内存页对齐地址
-    void *page_start = (void *)(addr & ~(getpagesize() - 1));
-    
-    // 2. 强行提权：让这块内存可写
-    if (mprotect(page_start, getpagesize(), PROT_READ | PROT_WRITE | PROT_EXEC) == -1) {
-        LOGI("mprotect 失败，无法修改内存权限! (Errno: %d)", errno);
-        return;
-    }
-
-    // 3. 备份原始指令 (应该是 fb 6b bb a9)
-    g_backup_instruction = *(uint32_t*)addr;
-    LOGI("备份原始指令: %08x", g_backup_instruction);
-
-    // 4. 写入自爆指令 BRK #0 (Hex: D4200000 - AArch64专用)
-    #if defined(__aarch64__)
-    *(uint32_t*)addr = 0xD4200000;
-    #endif
-    
-    // 5. 刷新缓存
-    __builtin___clear_cache((char*)addr, (char*)addr + 4);
-
-    // 6. 注册信号接收器
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(struct sigaction));
-    sa.sa_sigaction = TrapHandler;
-    sa.sa_flags = SA_SIGINFO;
-    sigaction(SIGTRAP, &sa, NULL); // 监听 SIGTRAP 信号
-
-    LOGI(">>> 软件断点已写入: %p (BRK 指令) <<<", (void*)addr);
-}
-
-// =============================================================
-// 寻找基址逻辑 (90MB 大文件策略)
+// 寻找基址逻辑 (90MB 策略)
 // =============================================================
 void* FindRealIl2CppBase() {
     FILE *fp = fopen("/proc/self/maps", "r");
@@ -138,6 +92,7 @@ void* FindRealIl2CppBase() {
             unsigned long start, end;
             if (sscanf(line, "%lx-%lx", &start, &end) == 2) {
                 unsigned long size = end - start;
+                // 30MB 阈值
                 if (size > 1024 * 1024 * 30) { 
                     if (size > max_size) {
                         max_size = size;
@@ -152,10 +107,10 @@ void* FindRealIl2CppBase() {
 }
 
 // =============================================================
-// 主逻辑
+// 主线程逻辑
 // =============================================================
 void hack_start(const char *game_data_dir) {
-    LOGI(">>> HACK START: 终极软件断点模式 (无需 Root 权限) <<<");
+    LOGI(">>> HACK START: Dobby 完美适配版 <<<");
 
     void* base_addr = nullptr;
     while (true) {
@@ -167,22 +122,34 @@ void hack_start(const char *game_data_dir) {
         sleep(1);
     }
 
-    // 计算地址
+    // 偏移量
     uintptr_t offset_PacketEncode = 0x11b54c8; 
-    g_target_addr = (uintptr_t)base_addr + offset_PacketEncode;
-    LOGI(">>> 目标地址: %p <<<", (void*)g_target_addr);
+    void* target_addr = (void*)((uintptr_t)base_addr + offset_PacketEncode);
+    
+    // --- 验证 OpCode (仅限 64 位) ---
+    #if defined(__aarch64__)
+        unsigned char* code = (unsigned char*)target_addr;
+        // 打印前 4 字节，让你确认是不是 fb 6b bb a9
+        LOGI("OpCode Check: %02x %02x %02x %02x", code[0], code[1], code[2], code[3]);
+    #endif
 
-    // 验证
-    unsigned char* code = (unsigned char*)g_target_addr;
-    LOGI("OpCode Check: %02x %02x %02x %02x", code[0], code[1], code[2], code[3]);
+    // --- 执行 Dobby Hook ---
+    // DobbyHook 会自动处理内存属性修改、指令替换等复杂操作
+    int ret = DobbyHook(target_addr, (void*)new_PacketEncode, (void**)&old_PacketEncode);
+    
+    if (ret == 0) {
+        LOGI(">>> DobbyHook 成功！Hook 已激活！ <<<");
+    } else {
+        LOGI(">>> DobbyHook 失败: %d (请检查日志) <<<", ret);
+    }
 
-    // 安装断点
-    InstallSoftwareBreakpoint(g_target_addr);
-
+    // 保持线程存活
     while(true) sleep(10);
 }
 
-// 模板代码
+// =============================================================
+// 模板导出代码 (勿动)
+// =============================================================
 std::string GetLibDir(JavaVM *vms) { return ""; }
 static std::string GetNativeBridgeLibrary() { return ""; }
 bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size_t length) { return false; }
