@@ -34,19 +34,21 @@ set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${LINKER_FLAGS}")
 set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} ${LINKER_FLAGS}")
 
 # ==============================================================================
-# 3. 【语法修正】下载 Dobby 并修复汇编 (使用 -e 参数避免解析错误)
+# 3. 【汇编指令替换】下载官方 Dobby 并替换非法指令
 # ==============================================================================
 include(FetchContent)
 
-message(STATUS "Downloading Official Dobby & Patching for NDK25...")
+message(STATUS "Downloading Official Dobby & Patching Assembly...")
 
 # 解释：
-# 使用 -e 参数明确告诉 sed 这是脚本的一部分，而不是文件名。
-# 这样 CMake 在传递参数时绝对不会出错。
+# 1. 还是下载官方 master.zip (保证能下载)
+# 2. 使用 sed 做高级替换：
+#    - 把 'adrp ... @PAGE' 替换成 'ldr x17, =common_closure_bridge_handler' (伪指令，自动处理地址)
+#    - 把 'add ... @PAGEOFF' 这一行直接删掉 (因为 ldr 已经把地址拿到了，不需要 add 了)
 FetchContent_Declare(
   dobby
   URL https://github.com/jmpews/Dobby/archive/refs/heads/master.zip
-  PATCH_COMMAND sed -i -e s/@PAGEOFF//g -e s/@PAGE//g ${CMAKE_CURRENT_BINARY_DIR}/_deps/dobby-src/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm
+  PATCH_COMMAND sed -i -e "s/adrp.*common_closure_bridge_handler@PAGE/ldr x17, =common_closure_bridge_handler/g" -e "/add.*common_closure_bridge_handler@PAGEOFF/d" ${CMAKE_CURRENT_BINARY_DIR}/_deps/dobby-src/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm
 )
 
 # 解压并配置
