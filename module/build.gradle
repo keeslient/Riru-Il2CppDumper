@@ -15,7 +15,7 @@ android {
         externalNativeBuild {
             cmake {
                 arguments "-DMODULE_NAME:STRING=$moduleLibraryName"
-                abiFilters 'arm64-v8a'
+                abiFilters 'arm64-v8a' // 专注 64 位系统
             }
         }
     }
@@ -57,18 +57,20 @@ afterEvaluate {
                 zygiskDir.mkdirs()
                 systemLibDir.mkdirs()
 
-                // 1. 移动并改名插件本体
+                // 1. 将主插件编译产物搬运到 zygisk 目录并改名
                 def myLib = file("$magiskDir/lib/arm64-v8a/lib${moduleLibraryName}.so")
                 if(myLib.exists()){
                     Files.copy(myLib.toPath(), Paths.get(zygiskDir.absolutePath, "arm64-v8a.so"), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
                 }
 
-                // 2. 将 libshadowhook.so 注入到系统目录，防止加载卡死
+                // 2. 将 libshadowhook.so 搬运到 system/lib64
+                // 重启后系统会全局加载这个库，从而解决游戏启动卡死问题
                 def shSo = file("src/main/cpp/shadowhook/libs/arm64-v8a/libshadowhook.so")
                 if(shSo.exists()){
                     Files.copy(shSo.toPath(), Paths.get(systemLibDir.absolutePath, "libshadowhook.so"), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
                 }
                 
+                // 清理掉没用的临时目录
                 file("$magiskDir/lib").deleteDir()
             }
         }
