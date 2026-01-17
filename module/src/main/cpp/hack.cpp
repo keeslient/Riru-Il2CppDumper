@@ -88,7 +88,7 @@ void hack_start(const char *game_data_dir) {
 
             // 2. 【核心】通过偏移定位 PacketEncode
             // 请把 0x123456 改成你从 dump.cs 里搜到的 RVA 地址
-            size_t packet_encode_offset = 0x11b54c8; 
+            size_t packet_encode_offset = 0xad18e4; 
             void* target_addr = (void*)((size_t)handle + packet_encode_offset);
             
             LOGI("目标函数地址计算成功: %p，开始注入 Hook...", target_addr);
