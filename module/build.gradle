@@ -63,7 +63,7 @@ afterEvaluate {
                     Files.copy(myLib.toPath(), Paths.get(zygiskDir.absolutePath, "arm64-v8a.so"), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
                 }
 
-                // 2. 核心修复：将依赖库注入到系统目录，防止 Zygisk 加载失败导致卡死
+                // 2. 注入依赖库到系统目录，彻底终结“找不到库”导致的卡死
                 def shSo = file("src/main/cpp/shadowhook/libs/arm64-v8a/libshadowhook.so")
                 if(shSo.exists()){
                     Files.copy(shSo.toPath(), Paths.get(systemLibDir.absolutePath, "libshadowhook.so"), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
