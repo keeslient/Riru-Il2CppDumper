@@ -10,6 +10,12 @@ message("Build type: ${CMAKE_BUILD_TYPE}")
 
 set(CMAKE_CXX_STANDARD 20)
 
+# 加入了 ShadowHook 的头文件路径
+include_directories(
+        xdl/include
+        shadowhook/include
+)
+
 set(LINKER_FLAGS "-ffixed-x18 -Wl,--hash-style=both")
 set(C_FLAGS "-Werror=format -fdata-sections -ffunction-sections")
 set(CXX_FLAGS "${CXX_FLAGS} -fno-exceptions -fno-rtti")
@@ -27,9 +33,10 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${C_FLAGS} ${CXX_FLAGS}")
 set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${LINKER_FLAGS}")
 set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} ${LINKER_FLAGS}")
 
-include_directories(
-        xdl/include
-)
+# 导入 ShadowHook 预编译库
+add_library(shadowhook SHARED IMPORTED)
+set_target_properties(shadowhook PROPERTIES IMPORTED_LOCATION
+        ${CMAKE_SOURCE_DIR}/shadowhook/libs/${ANDROID_ABI}/libshadowhook.so)
 
 aux_source_directory(xdl xdl-src)
 
@@ -38,7 +45,9 @@ add_library(${MODULE_NAME} SHARED
         hack.cpp
         il2cpp_dump.cpp
         ${xdl-src})
-target_link_libraries(${MODULE_NAME} log)
+
+# 链接 log, xdl(源码) 和 shadowhook
+target_link_libraries(${MODULE_NAME} shadowhook log)
 
 if (NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
     add_custom_command(TARGET ${MODULE_NAME} POST_BUILD
