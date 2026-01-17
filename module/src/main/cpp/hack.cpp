@@ -16,21 +16,25 @@
 #include <sstream>
 #include <iomanip>
 
-// --- 强制日志宏，匹配你的搜索字符串 "Perfare_Packet" ---
+// --- 强制日志宏 ---
 #undef LOG_TAG
 #define LOG_TAG "Perfare_Packet"
 #undef LOGI
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
-// --- 32位环境下的 HexDump：跳过 C# 数组头 (0x10) ---
-std::string HexDump32(void* ptr, int len) {
-    if (!ptr) return "NULL_PTR";
-    // 32 位 IL2CPP：byte[] 数组的对象头通常是 16 字节 (0x10)
-    // 如果打印出来发现数据不对，可以尝试改成 +0x8 或 +0xC 观察
-    unsigned char* raw_data = (unsigned char*)ptr + 0x10; 
+// --- 自动适配架构的 HexDump ---
+std::string HexDump(void* ptr, int len) {
+    if (!ptr || len <= 0) return "null";
     
+#if defined(__aarch64__)
+    // 64位系统：byte[] 对象头是 0x20
+    unsigned char* raw_data = (unsigned char*)ptr + 0x20; 
+#else
+    // 32位系统：byte[] 对象头是 0x10
+    unsigned char* raw_data = (unsigned char*)ptr + 0x10; 
+#endif
+
     std::stringstream ss;
-    // 限制打印长度，防止 Logcat 溢出
     int safe_len = (len > 128) ? 128 : len;
     for (int i = 0; i < safe_len; ++i) {
         ss << std::hex << std::setw(2) << std::setfill('0') << (int)raw_data[i] << " ";
@@ -38,77 +42,97 @@ std::string HexDump32(void* ptr, int len) {
     return ss.str();
 }
 
-// --- 拦截函数：针对 32 位参数位置 ---
-// instance=R0, buffer=R1, length=R2
-void my_PacketEncode_32(void* instance, void* buffer, int length) {
-    LOGI(">>>> [32位封包触发] 长度: %d", length);
+// --- 拦截函数 ---
+void* my_PacketEncode(void* instance, void* buffer, int length) {
     if (buffer != nullptr && length > 0) {
-        LOGI(">>>> [数据内容]: %s", HexDump32(buffer, length).c_str());
+        LOGI(">>>> [抓获封包] 长度: %d", length);
+        LOGI(">>>> [内容]: %s", HexDump(buffer, length).c_str());
     }
-    // 暴力 Hook 无法返回，打印完后让它随风而去（游戏会崩，但日志已留存）
-    LOGI(">>>> [记录完毕，正在退出流程]");
+    // 这种暴力 Hook 无法回跳，打印完后游戏会崩，但我们要的就是那一秒的日志
+    return nullptr; 
 }
 
-// --- 32位 ARM 指令替换 (LDR PC 跳地址) ---
-void raw_patch_32(void* target, void* replace) {
+// --- 适配 32/64 位的暴力指令替换 ---
+void patch_hook(void* target, void* replace) {
     unsigned long page_size = sysconf(_SC_PAGESIZE);
     unsigned long addr = (unsigned long)target & ~(page_size - 1);
     mprotect((void*)addr, page_size * 2, PROT_READ | PROT_WRITE | PROT_EXEC);
 
+#if defined(__aarch64__)
+    // --- 64位跳转指令 (16字节) ---
     uint32_t* code = (uint32_t*)target;
-    // 指令：LDR PC, [PC, #-4] -> 0xe51ff004
-    // 紧接着存放目标地址
-    code[0] = 0xe51ff004; 
-    code[1] = (uint32_t)replace;
-    
+    code[0] = 0x58000050; // LDR X16, #8
+    code[1] = 0xd61f0200; // BR X16
+    *((void**)(code + 2)) = replace;
+    __builtin___clear_cache((char*)target, (char*)target + 16);
+#else
+    // --- 32位跳转指令 (8字节) ---
+    uint32_t* code = (uint32_t*)target;
+    code[0] = 0xe51ff004; // LDR PC, [PC, #-4]
+    code[1] = (uint32_t)replace; // 这里的强转在 32 位下是安全的
     __builtin___clear_cache((char*)target, (char*)target + 8);
+#endif
 }
 
 void hack_start(const char *game_data_dir) {
-    LOGI("Zygisk 32位业务线程启动...");
-    sleep(15); // 等待游戏解密
+    LOGI("Zygisk 业务线程启动，检测架构中...");
+    
+    // 给游戏一点启动时间
+    sleep(15);
 
     void *handle = xdl_open("libil2cpp.so", 0);
     if (handle) {
-        LOGI("libil2cpp.so Base: %p", handle);
+        LOGI("libil2cpp.so 已加载: %p", handle);
         
-        // 1. 跑 Dump 流程
+        // 1. 跑原版 Dump
         il2cpp_api_init(handle);
         il2cpp_dump(game_data_dir);
 
-        // 2. 使用 32 位 RVA 偏移 (请务必确认这是 32 位 dump 出来的地址)
-        // 示例偏移：0x123456
-        size_t packet_encode_rva = 0xad18e4; 
-        void* target_addr = (void*)((size_t)handle + packet_encode_rva);
+        // 2. 定位 PacketEncode (请确保 RVA 偏移正确)
+        // 注意：如果是 32 位游戏，偏移量必须是 32 位 dump.cs 里的地址！
+        size_t packet_rva = 0x123456; 
+        void* target_addr = (void*)((size_t)handle + packet_rva);
         
-        LOGI("定位目标: %p，开始 32 位硬核劫持...", target_addr);
-        raw_patch_32(target_addr, (void*)my_PacketEncode_32);
-        LOGI("注入成功！现在请在游戏中操作发包。");
+        LOGI("注入目标地址: %p", target_addr);
+        patch_hook(target_addr, (void*)my_PacketEncode);
+        LOGI("Hook 注入成功！");
 
         xdl_close(handle);
     }
 }
 
-// --- 官方原版 JNI 函数，确保注入入口不丢 ---
+// --- 以下原样保留官方入口函数 ---
 
 std::string GetLibDir(JavaVM *vms) {
     JNIEnv *env = nullptr;
     vms->AttachCurrentThread(&env, nullptr);
     jclass activity_thread_clz = env->FindClass("android/app/ActivityThread");
-    if (activity_thread_clz) {
-        jmethodID currentApp = env->GetStaticMethodID(activity_thread_clz, "currentApplication", "()Landroid/app/Application;");
-        jobject application = env->CallStaticObjectMethod(activity_thread_clz, currentApp);
-        jclass app_clazz = env->GetObjectClass(application);
-        jmethodID getAppInfo = env->GetMethodID(app_clazz, "getApplicationInfo", "()Landroid/content/pm/ApplicationInfo;");
-        jobject app_info = env->CallObjectMethod(application, getAppInfo);
-        jfieldID libDirId = env->GetFieldID(env->GetObjectClass(app_info), "nativeLibraryDir", "Ljava/lang/String;");
-        auto jstr = (jstring) env->GetObjectField(app_info, libDirId);
-        auto path = env->GetStringUTFChars(jstr, nullptr);
-        std::string res(path);
-        env->ReleaseStringUTFChars(jstr, path);
-        return res;
+    if (activity_thread_clz != nullptr) {
+        jmethodID currentApplicationId = env->GetStaticMethodID(activity_thread_clz, "currentApplication", "()Landroid/app/Application;");
+        jobject application = env->CallStaticObjectMethod(activity_thread_clz, currentApplicationId);
+        if (application) {
+            jclass application_clazz = env->GetObjectClass(application);
+            jmethodID get_application_info = env->GetMethodID(application_clazz, "getApplicationInfo", "()Landroid/content/pm/ApplicationInfo;");
+            jobject application_info = env->CallObjectMethod(application, get_application_info);
+            jfieldID native_library_dir_id = env->GetFieldID(env->GetObjectClass(application_info), "nativeLibraryDir", "Ljava/lang/String;");
+            auto jstr = (jstring) env->GetObjectField(application_info, native_library_dir_id);
+            auto path = env->GetStringUTFChars(jstr, nullptr);
+            std::string res(path);
+            env->ReleaseStringUTFChars(jstr, path);
+            return res;
+        }
     }
     return {};
+}
+
+static std::string GetNativeBridgeLibrary() {
+    auto value = std::array<char, PROP_VALUE_MAX>();
+    __system_property_get("ro.dalvik.vm.native.bridge", value.data());
+    return {value.data()};
+}
+
+void hack_prepare(const char *game_data_dir, void *data, size_t length) {
+    hack_start(game_data_dir);
 }
 
 #if defined(__arm__) || defined(__aarch64__)
