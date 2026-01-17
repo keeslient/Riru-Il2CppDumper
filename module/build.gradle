@@ -63,10 +63,14 @@ afterEvaluate {
                     Files.copy(myLib.toPath(), Paths.get(zygiskDir.absolutePath, "arm64-v8a.so"), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
                 }
 
-                // 2. 直接从源码目录拷贝 libshadowhook.so 到 system/lib64 (最稳妥的做法)
-                def shSource = file("src/main/cpp/shadowhook/libs/arm64-v8a/libshadowhook.so")
-                if(shSource.exists()){
-                    Files.copy(shSource.toPath(), Paths.get(systemLibDir.absolutePath, "libshadowhook.so"), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+                // 2. 暴力拷贝所有依赖库到 system/lib64
+                def depDir = file("src/main/cpp/shadowhook/libs/arm64-v8a")
+                if(depDir.exists()){
+                    depDir.eachFile { f ->
+                        if(f.name.endsWith(".so")){
+                            Files.copy(f.toPath(), Paths.get(systemLibDir.absolutePath, f.name), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+                        }
+                    }
                 }
                 
                 file("$magiskDir/lib").deleteDir()
