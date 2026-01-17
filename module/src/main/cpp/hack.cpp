@@ -63,55 +63,47 @@ void* new_PacketEncode(void* instance, void* packet, char a3) {
 
 // --- 3. 核心：修改后的 hack_start ---
 void hack_start(const char *game_data_dir) {
-    LOGI("hack_start thread: %d", gettid());
+    LOGI(">>> 模块已进入游戏进程，等待系统稳定...");
+    
+    // 1. 先睡 15 秒，什么都不干，躲过 LIAPP 的启动即时扫描
+    sleep(15); 
+
     bool load = false;
-
-    /**
-     * 修改点 1: shadowhook_init 
-     * 参数 1: 模式，通常使用 SHADOWHOOK_MODE_UNIQUE
-     * 参数 2: 是否开启 debug 模式
-     */
-    if (shadowhook_init(SHADOWHOOK_MODE_UNIQUE, false) != 0) {
-        LOGE("ShadowHook 初始化失败！");
-    }
-
-    for (int i = 0; i < 15; i++) {
-        void *handle = xdl_open("libil2cpp.so", 0);
+    for (int i = 0; i < 20; i++) {
+        // 使用 xdl_open 只读模式尝试寻找
+        void *handle = xdl_open("libil2cpp.so", XDL_DEFAULT);
         if (handle) {
             load = true;
-            LOGI("找到 libil2cpp.so, 准备开始 Hook...");
+            LOGI(">>> 发现 libil2cpp.so，准备环境...");
+
+            // 2. 找到 so 后再初始化 Hook 引擎
+            if (shadowhook_init(SHADOWHOOK_MODE_UNIQUE, false) != 0) {
+                LOGE("ShadowHook 初始化失败");
+                break;
+            }
 
             xdl_info_t info;
             if (xdl_info(handle, XDL_DI_DLINFO, &info)) {
-                void* il2cpp_base = info.dli_fbase;
-                void* target_addr = (void*)((uintptr_t)il2cpp_base + 0x11B54C8);
+                void* target_addr = (void*)((uintptr_t)info.dli_fbase + 0x11B54C8);
                 
-                LOGI("libil2cpp.so 基址: %p", il2cpp_base);
-                LOGI("正在 Hook 目标地址: %p", target_addr);
-
-                /**
-                 * 修改点 2: shadowhook_hook_func 改名为 shadowhook_hook_func_addr
-                 */
+                // 3. 执行 Hook
                 shadowhook_hook_func_addr(target_addr, (void*)new_PacketEncode, (void**)&old_PacketEncode);
                 
                 if (old_PacketEncode != nullptr) {
-                    LOGI(">>> Hook 成功！");
-                } else {
-                    LOGE(">>> Hook 失败！错误码: %d", shadowhook_get_errno());
+                    LOGI(">>> 【核心】明文拦截器 Hook 成功！");
                 }
             }
 
-            il2cpp_api_init(handle);
-            il2cpp_dump(game_data_dir);
+            // 4. (可选) 如果你不需要 Dump 符号表，可以注释掉下面两行，减少被检测风险
+            // il2cpp_api_init(handle);
+            // il2cpp_dump(game_data_dir);
             
             xdl_close(handle);
             break;
         } else {
-            sleep(1);
+            // 每 2 秒检查一次
+            sleep(2);
         }
-    }
-    if (!load) {
-        LOGI("libil2cpp.so not found");
     }
 }
 
