@@ -1,4 +1,5 @@
 import org.apache.tools.ant.filters.FixCrLfFilter
+
 import java.nio.file.Paths
 import java.nio.file.Files
 
@@ -8,18 +9,18 @@ apply from: file(rootProject.file('module.gradle'))
 android {
     compileSdkVersion rootProject.ext.targetSdkVersion
     ndkVersion '25.2.9519653'
-    
     defaultConfig {
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
         externalNativeBuild {
             cmake {
                 arguments "-DMODULE_NAME:STRING=$moduleLibraryName"
-                abiFilters 'arm64-v8a' // 专注 64 位系统
             }
         }
     }
-
+    buildFeatures {
+        prefab true
+    }
     externalNativeBuild {
         cmake {
             path "src/main/cpp/CMakeLists.txt"
@@ -28,50 +29,52 @@ android {
     }
 }
 
+repositories {
+    mavenLocal()
+}
+
 afterEvaluate {
     android.libraryVariants.forEach { variant ->
         def variantCapped = variant.name.capitalize()
         def variantLowered = variant.name.toLowerCase()
+
         def zipName = "${magiskModuleId.replace('_', '-')}-${moduleVersion}-${variantLowered}.zip"
         def magiskDir = file("$outDir/magisk_module_$variantLowered")
 
         task("prepareMagiskFiles${variantCapped}", type: Sync) {
             dependsOn("assemble$variantCapped")
+
             def templatePath = "$rootDir/template/magisk_module"
+
             into magiskDir
-            from(templatePath) { exclude 'module.prop' }
+            from(templatePath) {
+                exclude 'module.prop'
+            }
             from(templatePath) {
                 include 'module.prop'
                 expand([
-                        id: magiskModuleId, name: moduleName, version: moduleVersion,
-                        versionCode: moduleVersionCode.toString(), author: moduleAuthor, description: moduleDescription
+                        id         : magiskModuleId,
+                        name       : moduleName,
+                        version    : moduleVersion,
+                        versionCode: moduleVersionCode.toString(),
+                        author     : moduleAuthor,
+                        description: moduleDescription,
                 ])
-                filter(FixCrLfFilter.class, eol: FixCrLfFilter.CrLf.newInstance("lf"))
+                filter(FixCrLfFilter.class,
+                        eol: FixCrLfFilter.CrLf.newInstance("lf"))
             }
-
-            from("$buildDir/intermediates/stripped_native_libs/$variantLowered/out/lib") { into 'lib' }
-
+            from("$buildDir/intermediates/stripped_native_libs/$variantLowered/out/lib") {
+                into 'lib'
+            }
             doLast {
-                def zygiskDir = file("$magiskDir/zygisk")
-                def systemLibDir = file("$magiskDir/system/lib64")
-                zygiskDir.mkdirs()
-                systemLibDir.mkdirs()
-
-                // 1. 将主插件编译产物搬运到 zygisk 目录并改名
-                def myLib = file("$magiskDir/lib/arm64-v8a/lib${moduleLibraryName}.so")
-                if(myLib.exists()){
-                    Files.copy(myLib.toPath(), Paths.get(zygiskDir.absolutePath, "arm64-v8a.so"), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+                file("$magiskDir/zygisk").mkdir()
+                fileTree("$magiskDir/lib").visit { f ->
+                    if (!f.directory) return
+                    def srcPath = Paths.get("${f.file.absolutePath}/lib${moduleLibraryName}.so")
+                    def dstPath = Paths.get("$magiskDir/zygisk/${f.path}.so")
+                    Files.move(srcPath, dstPath)
                 }
-
-                // 2. 将 libshadowhook.so 搬运到 system/lib64
-                // 重启后系统会全局加载这个库，从而解决游戏启动卡死问题
-                def shSo = file("src/main/cpp/shadowhook/libs/arm64-v8a/libshadowhook.so")
-                if(shSo.exists()){
-                    Files.copy(shSo.toPath(), Paths.get(systemLibDir.absolutePath, "libshadowhook.so"), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
-                }
-                
-                // 清理掉没用的临时目录
-                file("$magiskDir/lib").deleteDir()
+                new File("$magiskDir/lib").deleteDir()
             }
         }
 
@@ -81,6 +84,24 @@ afterEvaluate {
             archiveFileName.set(zipName)
             destinationDirectory.set(outDir)
         }
+
+        task("push${variantCapped}", type: Exec) {
+            dependsOn("zip${variantCapped}")
+            workingDir outDir
+            commandLine android.adbExecutable, "push", zipName, "/data/local/tmp/"
+        }
+
+        task("flash${variantCapped}", type: Exec) {
+            dependsOn("push${variantCapped}")
+            commandLine android.adbExecutable, "shell", "su", "-c",
+                    "magisk --install-module /data/local/tmp/${zipName}"
+        }
+
+        task("flashAndReboot${variantCapped}", type: Exec) {
+            dependsOn("flash${variantCapped}")
+            commandLine android.adbExecutable, "shell", "reboot"
+        }
+
         variant.assembleProvider.get().finalizedBy("zip${variantCapped}")
     }
 }
