@@ -57,14 +57,13 @@ afterEvaluate {
                 zygiskDir.mkdirs()
                 systemLibDir.mkdirs()
 
-                // 1. 移动并重命名插件本体 (arm64-v8a.so)
+                // 1. 移动并改名插件本体
                 def myLib = file("$magiskDir/lib/arm64-v8a/lib${moduleLibraryName}.so")
                 if(myLib.exists()){
                     Files.copy(myLib.toPath(), Paths.get(zygiskDir.absolutePath, "arm64-v8a.so"), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
                 }
 
-                // 2. 将 libshadowhook.so 拷贝到 system/lib64 目录
-                // 这能让系统 Linker 全局识别该库，彻底解决游戏找不到库而卡死的报错
+                // 2. 将 libshadowhook.so 注入到系统目录，防止加载卡死
                 def shSo = file("src/main/cpp/shadowhook/libs/arm64-v8a/libshadowhook.so")
                 if(shSo.exists()){
                     Files.copy(shSo.toPath(), Paths.get(systemLibDir.absolutePath, "libshadowhook.so"), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
