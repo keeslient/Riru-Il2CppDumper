@@ -2,7 +2,7 @@
 #include "il2cpp_dump.h"
 #include "log.h"
 #include "xdl.h"
-#include "shadowhook.h" // 必须包含 ShadowHook 头文件
+#include "shadowhook.h" 
 #include <cstring>
 #include <cstdio>
 #include <unistd.h>
@@ -31,18 +31,15 @@ std::string bytesToHex(uint8_t* data, uint32_t len) {
 }
 
 // --- 2. 核心：封包拦截 Hook 函数 ---
-// 对应 sub_11B54C8
 void* new_PacketEncode(void* instance, void* packet, char a3) {
     if (packet != nullptr) {
-        // 根据 sub 函数分析提取数据
-        // Packet -> MemoryStream(0x10) -> byte[] Array(0x10)
+        // 按照之前的 sub 函数分析提取数据
         uintptr_t* stream_ptr = (uintptr_t*)((uintptr_t)packet + 0x10);
         
         if (stream_ptr && (uintptr_t)*stream_ptr > 0x100000) {
             uintptr_t* array_ptr = (uintptr_t*)(*stream_ptr + 0x10);
             
             if (array_ptr && (uintptr_t)*array_ptr > 0x100000) {
-                // IL2CPP 数组结构：0x18是长度, 0x20是数据
                 uint32_t len = *(uint32_t*)(*array_ptr + 0x18);
                 uint8_t* data = (uint8_t*)(*array_ptr + 0x20);
 
@@ -50,7 +47,6 @@ void* new_PacketEncode(void* instance, void* packet, char a3) {
                     LOGI("================ [ 捕获明文封包 ] ================");
                     LOGI("长度: %u, 加密模式: %d", len, (int)a3);
                     
-                    // 读取滚动 Key (instance 偏移 0x10 处)
                     if (instance) {
                         uint8_t current_key = *(uint8_t*)((uintptr_t)instance + 16);
                         LOGI("当前滚动 Key: 0x%02X", current_key);
@@ -62,7 +58,6 @@ void* new_PacketEncode(void* instance, void* packet, char a3) {
             }
         }
     }
-    // 调用原函数，保证游戏通讯不中断
     return old_PacketEncode(instance, packet, a3);
 }
 
@@ -71,8 +66,12 @@ void hack_start(const char *game_data_dir) {
     LOGI("hack_start thread: %d", gettid());
     bool load = false;
 
-    // A. 初始化 ShadowHook (极其重要)
-    if (shadowhook_init() != 0) {
+    /**
+     * 修改点 1: shadowhook_init 
+     * 参数 1: 模式，通常使用 SHADOWHOOK_MODE_UNIQUE
+     * 参数 2: 是否开启 debug 模式
+     */
+    if (shadowhook_init(SHADOWHOOK_MODE_UNIQUE, false) != 0) {
         LOGE("ShadowHook 初始化失败！");
     }
 
@@ -80,30 +79,28 @@ void hack_start(const char *game_data_dir) {
         void *handle = xdl_open("libil2cpp.so", 0);
         if (handle) {
             load = true;
-            LOGI("找到 libil2cpp.so, 准备开始 Hook 和 Dump...");
+            LOGI("找到 libil2cpp.so, 准备开始 Hook...");
 
-            // B. 使用 xdl 获取基址
             xdl_info_t info;
             if (xdl_info(handle, XDL_DI_DLINFO, &info)) {
                 void* il2cpp_base = info.dli_fbase;
-                LOGI("libil2cpp.so 基址: %p", il2cpp_base);
-
-                // C. 执行 Inline Hook
-                // 偏移地址 0x11B54C8
                 void* target_addr = (void*)((uintptr_t)il2cpp_base + 0x11B54C8);
+                
+                LOGI("libil2cpp.so 基址: %p", il2cpp_base);
                 LOGI("正在 Hook 目标地址: %p", target_addr);
 
-                // 使用 ShadowHook 执行 Hook
-                shadowhook_hook_func(target_addr, (void*)new_PacketEncode, (void**)&old_PacketEncode);
+                /**
+                 * 修改点 2: shadowhook_hook_func 改名为 shadowhook_hook_func_addr
+                 */
+                shadowhook_hook_func_addr(target_addr, (void*)new_PacketEncode, (void**)&old_PacketEncode);
                 
                 if (old_PacketEncode != nullptr) {
-                    LOGI(">>> Hook 成功！明文拦截器已就绪。");
+                    LOGI(">>> Hook 成功！");
                 } else {
                     LOGE(">>> Hook 失败！错误码: %d", shadowhook_get_errno());
                 }
             }
 
-            // D. 执行你原有的 Dump 逻辑
             il2cpp_api_init(handle);
             il2cpp_dump(game_data_dir);
             
@@ -114,9 +111,12 @@ void hack_start(const char *game_data_dir) {
         }
     }
     if (!load) {
-        LOGI("libil2cpp.so not found in thread %d", gettid());
+        LOGI("libil2cpp.so not found");
     }
 }
+
+// ... 后面所有的 GetLibDir 等辅助函数代码保持不变 ...
+// [请保留你原本文件中的 GetLibDir 到 JNI_OnLoad 结尾的所有代码]
 
 // --- 4. 保持你原有的 JNI 辅助函数不变 ---
 
