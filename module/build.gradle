@@ -77,7 +77,7 @@ afterEvaluate {
                 fileTree("$magiskDir/lib").visit { f ->
                     if (!f.directory) return
                     def srcPath = Paths.get("${f.file.absolutePath}/lib${moduleLibraryName}.so")
-                    def dstPath = Paths.get("$magiskDir/zygisk/${f.path}.so")
+                   def dstPath = Paths.get("$magiskDir/zygisk/${f.path}")
                     Files.move(srcPath, dstPath)
                 }
                 new File("$magiskDir/lib").deleteDir()
