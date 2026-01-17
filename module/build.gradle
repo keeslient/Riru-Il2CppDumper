@@ -32,41 +32,28 @@ afterEvaluate {
     android.libraryVariants.forEach { variant ->
         def variantCapped = variant.name.capitalize()
         def variantLowered = variant.name.toLowerCase()
-
         def zipName = "${magiskModuleId.replace('_', '-')}-${moduleVersion}-${variantLowered}.zip"
         def magiskDir = file("$outDir/magisk_module_$variantLowered")
 
         task("prepareMagiskFiles${variantCapped}", type: Sync) {
             dependsOn("assemble$variantCapped")
-
             def templatePath = "$rootDir/template/magisk_module"
-
             into magiskDir
-            from(templatePath) {
-                exclude 'module.prop'
-            }
+            from(templatePath) { exclude 'module.prop' }
             from(templatePath) {
                 include 'module.prop'
                 expand([
-                        id         : magiskModuleId,
-                        name       : moduleName,
-                        version    : moduleVersion,
-                        versionCode: moduleVersionCode.toString(),
-                        author     : moduleAuthor,
-                        description: moduleDescription,
+                        id: magiskModuleId, name: moduleName, version: moduleVersion,
+                        versionCode: moduleVersionCode.toString(), author: moduleAuthor, description: moduleDescription
                 ])
                 filter(FixCrLfFilter.class, eol: FixCrLfFilter.CrLf.newInstance("lf"))
             }
 
-            from("$buildDir/intermediates/stripped_native_libs/$variantLowered/out/lib") {
-                into 'lib'
-            }
+            from("$buildDir/intermediates/stripped_native_libs/$variantLowered/out/lib") { into 'lib' }
 
             doLast {
                 def zygiskDir = file("$magiskDir/zygisk")
                 zygiskDir.mkdirs()
-
-                // 核心逻辑：只移动主插件并改名，忽略其他中间库
                 fileTree("$magiskDir/lib").visit { f ->
                     if (f.directory) return
                     def abi = f.file.parentFile.name
@@ -84,7 +71,6 @@ afterEvaluate {
             archiveFileName.set(zipName)
             destinationDirectory.set(outDir)
         }
-
         variant.assembleProvider.get().finalizedBy("zip${variantCapped}")
     }
 }
