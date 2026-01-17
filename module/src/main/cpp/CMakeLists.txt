@@ -1,41 +1,46 @@
 cmake_minimum_required(VERSION 3.18.1)
 
-# 项目名称
-project("il2cppdumper")
+if (NOT DEFINED MODULE_NAME)
+    message(FATAL_ERROR "MODULE_NAME is not set")
+else ()
+    project(${MODULE_NAME})
+endif ()
 
-# 设置模块名称
-set(MODULE_NAME "il2cppdumper")
+message("Build type: ${CMAKE_BUILD_TYPE}")
 
-# 1. 定义依赖目录（都在当前目录下）
-set(SH_DIR "${CMAKE_CURRENT_SOURCE_DIR}/shadowhook")
-set(XDL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/xdl")
+set(CMAKE_CXX_STANDARD 20)
 
-# 2. 自动搜索 xdl 目录下所有的 .c 源文件（确保补全所有 xdl 零件）
-file(GLOB XDL_SOURCES "${XDL_DIR}/*.c")
+set(LINKER_FLAGS "-ffixed-x18 -Wl,--hash-style=both")
+set(C_FLAGS "-Werror=format -fdata-sections -ffunction-sections")
+set(CXX_FLAGS "${CXX_FLAGS} -fno-exceptions -fno-rtti")
 
-# 3. 编译插件本体
-# 注意：这里我们只编译源码，不链接外部 .so，防止加载时 Linker 找不到库而卡死
+if (NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(C_FLAGS "${C_FLAGS} -O2 -fvisibility=hidden -fvisibility-inlines-hidden")
+    set(LINKER_FLAGS "${LINKER_FLAGS} -Wl,-exclude-libs,ALL -Wl,--gc-sections -Wl,--strip-all")
+else ()
+    set(C_FLAGS "${C_FLAGS} -O0")
+endif ()
+
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${C_FLAGS}")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${C_FLAGS} ${CXX_FLAGS}")
+
+set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${LINKER_FLAGS}")
+set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} ${LINKER_FLAGS}")
+
+include_directories(
+        xdl/include
+)
+
+aux_source_directory(xdl xdl-src)
+
 add_library(${MODULE_NAME} SHARED
-    hack.cpp
-    ${XDL_SOURCES}
-)
+        main.cpp
+        hack.cpp
+        il2cpp_dump.cpp
+        ${xdl-src})
+target_link_libraries(${MODULE_NAME} log)
 
-# 4. 设置头文件搜索路径
-target_include_directories(${MODULE_NAME} PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    "${XDL_DIR}"
-    "${SH_DIR}/include"
-)
-
-# 5. 链接系统库（仅链接必有的 log 和 android 库）
-target_link_libraries(${MODULE_NAME}
-    log
-    android
-)
-
-# 6. 隐藏符号，减小体积，提升隐蔽性
-set_target_properties(${MODULE_NAME} PROPERTIES
-    C_VISIBILITY_PRESET hidden
-    CXX_VISIBILITY_PRESET hidden
-    VISIBILITY_INLINES_HIDDEN ON
-)
+if (NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+    add_custom_command(TARGET ${MODULE_NAME} POST_BUILD
+            COMMAND ${CMAKE_STRIP} --strip-all --remove-section=.comment "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/lib${MODULE_NAME}.so")
+endif ()
