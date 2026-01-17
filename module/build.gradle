@@ -1,5 +1,4 @@
 import org.apache.tools.ant.filters.FixCrLfFilter
-
 import java.nio.file.Paths
 import java.nio.file.Files
 
@@ -9,24 +8,26 @@ apply from: file(rootProject.file('module.gradle'))
 android {
     compileSdkVersion rootProject.ext.targetSdkVersion
     ndkVersion '25.2.9519653'
+    
     defaultConfig {
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
         externalNativeBuild {
             cmake {
                 arguments "-DMODULE_NAME:STRING=$moduleLibraryName"
-                // --- 修改点 1：限制 CMake 只编译 ARM 架构 ---
+                // 只编译 ARM 架构，跳过 x86
                 abiFilters 'arm64-v8a', 'armeabi-v7a'
             }
         }
-        // --- 修改点 2：限制 NDK 打包也只保留 ARM 架构 ---
         ndk {
             abiFilters 'arm64-v8a', 'armeabi-v7a'
         }
     }
+
     buildFeatures {
         prefab true
     }
+
     externalNativeBuild {
         cmake {
             path "src/main/cpp/CMakeLists.txt"
@@ -69,18 +70,36 @@ afterEvaluate {
                 filter(FixCrLfFilter.class,
                         eol: FixCrLfFilter.CrLf.newInstance("lf"))
             }
+
+            // 从编译生成的中间目录获取所有 .so 文件
             from("$buildDir/intermediates/stripped_native_libs/$variantLowered/out/lib") {
                 into 'lib'
             }
+
             doLast {
-                file("$magiskDir/zygisk").mkdir()
+                // 创建 zygisk 目录
+                def zygiskDir = file("$magiskDir/zygisk")
+                zygiskDir.mkdirs()
+
+                // 遍历 lib 文件夹下的 ABI 目录 (arm64-v8a, armeabi-v7a)
                 fileTree("$magiskDir/lib").visit { f ->
-                    if (!f.directory) return
-                    def srcPath = Paths.get("${f.file.absolutePath}/lib${moduleLibraryName}.so")
-                   def dstPath = Paths.get("$magiskDir/zygisk/${f.path}")
-                    Files.move(srcPath, dstPath)
+                    if (f.directory) return
+
+                    def abi = f.file.parentFile.name // 获取 arm64-v8a 等
+                    
+                    if (f.name == "lib${moduleLibraryName}.so") {
+                        // 1. 如果是主插件，重命名为 abi.so (如 arm64-v8a.so)
+                        Files.move(f.file.toPath(), Paths.get(zygiskDir.absolutePath, "${abi}.so"))
+                    } else if (f.name == "libshadowhook.so") {
+                        // 2. 如果是 shadowhook 依赖库，保持原名拷贝到 zygisk 目录
+                        // 注意：这里需要根据架构分类，但 Zygisk 通常在加载 abi.so 时会搜索同目录
+                        def targetDep = file("${zygiskDir.absolutePath}/${f.name}")
+                        Files.copy(f.file.toPath(), targetDep.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+                    }
                 }
-                new File("$magiskDir/lib").deleteDir()
+                
+                // 清理掉临时的 lib 目录
+                file("$magiskDir/lib").deleteDir()
             }
         }
 
@@ -91,6 +110,7 @@ afterEvaluate {
             destinationDirectory.set(outDir)
         }
 
+        // ADB 自动推送和刷入脚本（保持不变）
         task("push${variantCapped}", type: Exec) {
             dependsOn("zip${variantCapped}")
             workingDir outDir
