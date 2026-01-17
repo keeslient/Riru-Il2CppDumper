@@ -1,46 +1,33 @@
 cmake_minimum_required(VERSION 3.18.1)
+project("il2cppdumper")
 
-if (NOT DEFINED MODULE_NAME)
-    message(FATAL_ERROR "MODULE_NAME is not set")
-else ()
-    project(${MODULE_NAME})
-endif ()
+set(MODULE_NAME "il2cppdumper")
 
-message("Build type: ${CMAKE_BUILD_TYPE}")
+# 1. 自动搜索当前目录下 xdl 文件夹里的所有 C 文件
+set(XDL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/xdl")
+file(GLOB XDL_SOURCES "${XDL_DIR}/*.c")
 
-set(CMAKE_CXX_STANDARD 20)
-
-set(LINKER_FLAGS "-ffixed-x18 -Wl,--hash-style=both")
-set(C_FLAGS "-Werror=format -fdata-sections -ffunction-sections")
-set(CXX_FLAGS "${CXX_FLAGS} -fno-exceptions -fno-rtti")
-
-if (NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
-    set(C_FLAGS "${C_FLAGS} -O2 -fvisibility=hidden -fvisibility-inlines-hidden")
-    set(LINKER_FLAGS "${LINKER_FLAGS} -Wl,-exclude-libs,ALL -Wl,--gc-sections -Wl,--strip-all")
-else ()
-    set(C_FLAGS "${C_FLAGS} -O0")
-endif ()
-
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${C_FLAGS}")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${C_FLAGS} ${CXX_FLAGS}")
-
-set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${LINKER_FLAGS}")
-set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} ${LINKER_FLAGS}")
-
-include_directories(
-        xdl/include
+# 2. 编译插件本体
+add_library(${MODULE_NAME} SHARED
+    hack.cpp
+    ${XDL_SOURCES}
 )
 
-aux_source_directory(xdl xdl-src)
+# 3. 包含头文件路径
+target_include_directories(${MODULE_NAME} PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    "${XDL_DIR}"
+)
 
-add_library(${MODULE_NAME} SHARED
-        main.cpp
-        hack.cpp
-        il2cpp_dump.cpp
-        ${xdl-src})
-target_link_libraries(${MODULE_NAME} log)
+# 4. 只链接系统自带的库，不带任何累赘
+target_link_libraries(${MODULE_NAME}
+    log
+    android
+)
 
-if (NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
-    add_custom_command(TARGET ${MODULE_NAME} POST_BUILD
-            COMMAND ${CMAKE_STRIP} --strip-all --remove-section=.comment "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/lib${MODULE_NAME}.so")
-endif ()
+# 隐藏符号，减小体积
+set_target_properties(${MODULE_NAME} PROPERTIES
+    C_VISIBILITY_PRESET hidden
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON
+)
