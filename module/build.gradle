@@ -1,5 +1,4 @@
 import org.apache.tools.ant.filters.FixCrLfFilter
-
 import java.nio.file.Paths
 import java.nio.file.Files
 
@@ -9,18 +8,18 @@ apply from: file(rootProject.file('module.gradle'))
 android {
     compileSdkVersion rootProject.ext.targetSdkVersion
     ndkVersion '25.2.9519653'
+    
     defaultConfig {
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
         externalNativeBuild {
             cmake {
                 arguments "-DMODULE_NAME:STRING=$moduleLibraryName"
+                abiFilters 'arm64-v8a'
             }
         }
     }
-    buildFeatures {
-        prefab true
-    }
+
     externalNativeBuild {
         cmake {
             path "src/main/cpp/CMakeLists.txt"
@@ -29,52 +28,39 @@ android {
     }
 }
 
-repositories {
-    mavenLocal()
-}
-
 afterEvaluate {
     android.libraryVariants.forEach { variant ->
         def variantCapped = variant.name.capitalize()
         def variantLowered = variant.name.toLowerCase()
-
         def zipName = "${magiskModuleId.replace('_', '-')}-${moduleVersion}-${variantLowered}.zip"
         def magiskDir = file("$outDir/magisk_module_$variantLowered")
 
         task("prepareMagiskFiles${variantCapped}", type: Sync) {
             dependsOn("assemble$variantCapped")
-
             def templatePath = "$rootDir/template/magisk_module"
-
             into magiskDir
-            from(templatePath) {
-                exclude 'module.prop'
-            }
+            from(templatePath) { exclude 'module.prop' }
             from(templatePath) {
                 include 'module.prop'
-                expand([
-                        id         : magiskModuleId,
-                        name       : moduleName,
-                        version    : moduleVersion,
-                        versionCode: moduleVersionCode.toString(),
-                        author     : moduleAuthor,
-                        description: moduleDescription,
-                ])
-                filter(FixCrLfFilter.class,
-                        eol: FixCrLfFilter.CrLf.newInstance("lf"))
+                expand([id: magiskModuleId, name: moduleName, version: moduleVersion, versionCode: moduleVersionCode.toString(), author: moduleAuthor, description: moduleDescription])
+                filter(FixCrLfFilter.class, eol: FixCrLfFilter.CrLf.newInstance("lf"))
             }
-            from("$buildDir/intermediates/stripped_native_libs/$variantLowered/out/lib") {
-                into 'lib'
-            }
+
+            from("$buildDir/intermediates/stripped_native_libs/$variantLowered/out/lib") { into 'lib' }
+
             doLast {
-                file("$magiskDir/zygisk").mkdir()
+                def zygiskDir = file("$magiskDir/zygisk")
+                zygiskDir.mkdirs()
+                
+                // 只移动唯一的插件，没有任何多余的 so 依赖
                 fileTree("$magiskDir/lib").visit { f ->
-                    if (!f.directory) return
-                    def srcPath = Paths.get("${f.file.absolutePath}/lib${moduleLibraryName}.so")
-                    def dstPath = Paths.get("$magiskDir/zygisk/${f.path}.so")
-                    Files.move(srcPath, dstPath)
+                    if (f.directory) return
+                    def abi = f.file.parentFile.name
+                    if (f.name == "lib${moduleLibraryName}.so") {
+                        Files.move(f.file.toPath(), Paths.get(zygiskDir.absolutePath, "${abi}.so"))
+                    }
                 }
-                new File("$magiskDir/lib").deleteDir()
+                file("$magiskDir/lib").deleteDir()
             }
         }
 
@@ -84,24 +70,6 @@ afterEvaluate {
             archiveFileName.set(zipName)
             destinationDirectory.set(outDir)
         }
-
-        task("push${variantCapped}", type: Exec) {
-            dependsOn("zip${variantCapped}")
-            workingDir outDir
-            commandLine android.adbExecutable, "push", zipName, "/data/local/tmp/"
-        }
-
-        task("flash${variantCapped}", type: Exec) {
-            dependsOn("push${variantCapped}")
-            commandLine android.adbExecutable, "shell", "su", "-c",
-                    "magisk --install-module /data/local/tmp/${zipName}"
-        }
-
-        task("flashAndReboot${variantCapped}", type: Exec) {
-            dependsOn("flash${variantCapped}")
-            commandLine android.adbExecutable, "shell", "reboot"
-        }
-
         variant.assembleProvider.get().finalizedBy("zip${variantCapped}")
     }
 }
