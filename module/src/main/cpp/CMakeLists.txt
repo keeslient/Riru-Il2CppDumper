@@ -1,36 +1,46 @@
 cmake_minimum_required(VERSION 3.18.1)
-project("il2cppdumper")
 
-set(MODULE_NAME "il2cppdumper")
+if (NOT DEFINED MODULE_NAME)
+    message(FATAL_ERROR "MODULE_NAME is not set")
+else ()
+    project(${MODULE_NAME})
+endif ()
 
-# 1. 设置项目自带的 xdl 路径
-set(XDL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/xdl")
+message("Build type: ${CMAKE_BUILD_TYPE}")
 
-# 2. 自动包含 xdl 目录下所有的 .c 源文件
-file(GLOB XDL_SOURCES "${XDL_DIR}/*.c")
+set(CMAKE_CXX_STANDARD 20)
 
-# 3. 编译插件本体
-# 注意：我们不链接任何外部 Hook 库，只编译源码
+set(LINKER_FLAGS "-ffixed-x18 -Wl,--hash-style=both")
+set(C_FLAGS "-Werror=format -fdata-sections -ffunction-sections")
+set(CXX_FLAGS "${CXX_FLAGS} -fno-exceptions -fno-rtti")
+
+if (NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(C_FLAGS "${C_FLAGS} -O2 -fvisibility=hidden -fvisibility-inlines-hidden")
+    set(LINKER_FLAGS "${LINKER_FLAGS} -Wl,-exclude-libs,ALL -Wl,--gc-sections -Wl,--strip-all")
+else ()
+    set(C_FLAGS "${C_FLAGS} -O0")
+endif ()
+
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${C_FLAGS}")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${C_FLAGS} ${CXX_FLAGS}")
+
+set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${LINKER_FLAGS}")
+set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} ${LINKER_FLAGS}")
+
+include_directories(
+        xdl/include
+)
+
+aux_source_directory(xdl xdl-src)
+
 add_library(${MODULE_NAME} SHARED
-    hack.cpp
-    ${XDL_SOURCES}
-)
+        main.cpp
+        hack.cpp
+        il2cpp_dump.cpp
+        ${xdl-src})
+target_link_libraries(${MODULE_NAME} log)
 
-# 4. 包含头文件路径 (关键修复：xdl 的头文件在 include 文件夹里)
-target_include_directories(${MODULE_NAME} PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    "${XDL_DIR}/include"
-)
-
-# 5. 只链接系统日志库，不产生任何 .so 依赖，彻底防止加载卡死
-target_link_libraries(${MODULE_NAME}
-    log
-    android
-)
-
-# 6. 符号隐藏优化
-set_target_properties(${MODULE_NAME} PROPERTIES
-    C_VISIBILITY_PRESET hidden
-    CXX_VISIBILITY_PRESET hidden
-    VISIBILITY_INLINES_HIDDEN ON
-)
+if (NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+    add_custom_command(TARGET ${MODULE_NAME} POST_BUILD
+            COMMAND ${CMAKE_STRIP} --strip-all --remove-section=.comment "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/lib${MODULE_NAME}.so")
+endif ()
