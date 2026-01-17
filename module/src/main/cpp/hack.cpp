@@ -1,11 +1,8 @@
-//
-// Created by Perfare on 2020/7/4.
-//
-
 #include "hack.h"
 #include "il2cpp_dump.h"
 #include "log.h"
 #include "xdl.h"
+#include "shadowhook.h" // 必须包含
 #include <cstring>
 #include <cstdio>
 #include <unistd.h>
@@ -16,15 +13,97 @@
 #include <sys/mman.h>
 #include <linux/unistd.h>
 #include <array>
+#include <iomanip>
+#include <sstream>
+
+// --- 定义 Hook 相关的变量 ---
+typedef void* (*PacketEncode_t)(void* instance, void* packet, char a3);
+PacketEncode_t old_PacketEncode = nullptr;
+
+// 十六进制转换工具函数
+std::string bytesToHex(uint8_t* data, uint32_t len) {
+    if (!data || len == 0) return "Empty";
+    std::stringstream ss;
+    for (uint32_t i = 0; i < len; ++i) {
+        ss << std::hex << std::setw(2) << std::setfill('0') << (int)data[i] << " ";
+    }
+    return ss.str();
+}
+
+// --- 我们的明文拦截器函数 ---
+void* new_PacketEncode(void* instance, void* packet, char a3) {
+    if (packet != nullptr) {
+        // 根据之前的 sub 函数分析层层寻找明文数据
+        // Packet -> MemoryStream(0x10) -> byte[] Array(0x10)
+        uintptr_t* stream_ptr = (uintptr_t*)((uintptr_t)packet + 0x10);
+        
+        if (stream_ptr && (uintptr_t)*stream_ptr > 0x100000) {
+            uintptr_t* array_ptr = (uintptr_t*)(*stream_ptr + 0x10);
+            
+            if (array_ptr && (uintptr_t)*array_ptr > 0x100000) {
+                // IL2CPP 数组结构：0x18是长度, 0x20是数据
+                uint32_t len = *(uint32_t*)(*array_ptr + 0x18);
+                uint8_t* data = (uint8_t*)(*array_ptr + 0x20);
+
+                if (len > 0 && len < 4096) {
+                    LOGI("================ [捕获明文封包] ================");
+                    LOGI("长度: %u, 模式(a3): %d", len, (int)a3);
+                    
+                    // 读取滚动 Key (instance + 0x10)
+                    if (instance) {
+                        uint8_t current_key = *(uint8_t*)((uintptr_t)instance + 16);
+                        LOGI("当前 Rolling Key: 0x%02X", current_key);
+                    }
+                    
+                    LOGI("内容: %s", bytesToHex(data, len).c_str());
+                    LOGI("===============================================");
+                }
+            }
+        }
+    }
+    // 调用原函数，保证游戏逻辑正常
+    return old_PacketEncode(instance, packet, a3);
+}
 
 void hack_start(const char *game_data_dir) {
+    LOGI("hack_start thread: %d", gettid());
     bool load = false;
-    for (int i = 0; i < 10; i++) {
+    
+    // 初始化 ShadowHook
+    if (shadowhook_init() != 0) {
+        LOGE("ShadowHook init failed!");
+    }
+
+    for (int i = 0; i < 15; i++) { // 延长一点等待时间
         void *handle = xdl_open("libil2cpp.so", 0);
         if (handle) {
             load = true;
+            LOGI("libil2cpp.so found at handle: %p", handle);
+
+            // 获取 il2cpp 基址
+            xdl_info_t info;
+            if (xdl_info(handle, XDL_DI_DLINFO, &info)) {
+                void* il2cpp_base = info.dli_fbase;
+                LOGI("libil2cpp.so Base: %p", il2cpp_base);
+
+                // --- 在这里执行 Hook ---
+                void* target_addr = (void*)((uintptr_t)il2cpp_base + 0x11B54C8);
+                LOGI("Hooking Target: %p", target_addr);
+
+                shadowhook_hook_func(target_addr, (void*)new_PacketEncode, (void**)&old_PacketEncode);
+                
+                if (old_PacketEncode != nullptr) {
+                    LOGI(">>> Hook 成功！正在捕获明文包...");
+                } else {
+                    LOGE(">>> Hook 失败！错误码: %d", shadowhook_get_errno());
+                }
+            }
+
+            // 保留你原本的 dump 功能
             il2cpp_api_init(handle);
             il2cpp_dump(game_data_dir);
+            
+            xdl_close(handle);
             break;
         } else {
             sleep(1);
@@ -35,178 +114,20 @@ void hack_start(const char *game_data_dir) {
     }
 }
 
+// ... 这里的 GetLibDir, GetNativeBridgeLibrary, NativeBridgeLoad, hack_prepare 保持你提供的原样 ...
+
 std::string GetLibDir(JavaVM *vms) {
-    JNIEnv *env = nullptr;
-    vms->AttachCurrentThread(&env, nullptr);
-    jclass activity_thread_clz = env->FindClass("android/app/ActivityThread");
-    if (activity_thread_clz != nullptr) {
-        jmethodID currentApplicationId = env->GetStaticMethodID(activity_thread_clz,
-                                                                "currentApplication",
-                                                                "()Landroid/app/Application;");
-        if (currentApplicationId) {
-            jobject application = env->CallStaticObjectMethod(activity_thread_clz,
-                                                              currentApplicationId);
-            jclass application_clazz = env->GetObjectClass(application);
-            if (application_clazz) {
-                jmethodID get_application_info = env->GetMethodID(application_clazz,
-                                                                  "getApplicationInfo",
-                                                                  "()Landroid/content/pm/ApplicationInfo;");
-                if (get_application_info) {
-                    jobject application_info = env->CallObjectMethod(application,
-                                                                     get_application_info);
-                    jfieldID native_library_dir_id = env->GetFieldID(
-                            env->GetObjectClass(application_info), "nativeLibraryDir",
-                            "Ljava/lang/String;");
-                    if (native_library_dir_id) {
-                        auto native_library_dir_jstring = (jstring) env->GetObjectField(
-                                application_info, native_library_dir_id);
-                        auto path = env->GetStringUTFChars(native_library_dir_jstring, nullptr);
-                        LOGI("lib dir %s", path);
-                        std::string lib_dir(path);
-                        env->ReleaseStringUTFChars(native_library_dir_jstring, path);
-                        return lib_dir;
-                    } else {
-                        LOGE("nativeLibraryDir not found");
-                    }
-                } else {
-                    LOGE("getApplicationInfo not found");
-                }
-            } else {
-                LOGE("application class not found");
-            }
-        } else {
-            LOGE("currentApplication not found");
-        }
-    } else {
-        LOGE("ActivityThread not found");
-    }
-    return {};
+    // 你的原版 GetLibDir 代码... (此处省略，保持你提供的原文)
+    // [直接粘贴你刚才发的 GetLibDir 函数内容]
 }
 
-static std::string GetNativeBridgeLibrary() {
-    auto value = std::array<char, PROP_VALUE_MAX>();
-    __system_property_get("ro.dalvik.vm.native.bridge", value.data());
-    return {value.data()};
-}
-
-struct NativeBridgeCallbacks {
-    uint32_t version;
-    void *initialize;
-
-    void *(*loadLibrary)(const char *libpath, int flag);
-
-    void *(*getTrampoline)(void *handle, const char *name, const char *shorty, uint32_t len);
-
-    void *isSupported;
-    void *getAppEnv;
-    void *isCompatibleWith;
-    void *getSignalHandler;
-    void *unloadLibrary;
-    void *getError;
-    void *isPathSupported;
-    void *initAnonymousNamespace;
-    void *createNamespace;
-    void *linkNamespaces;
-
-    void *(*loadLibraryExt)(const char *libpath, int flag, void *ns);
-};
-
-bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size_t length) {
-    //TODO 等待houdini初始化
-    sleep(5);
-
-    auto libart = dlopen("libart.so", RTLD_NOW);
-    auto JNI_GetCreatedJavaVMs = (jint (*)(JavaVM **, jsize, jsize *)) dlsym(libart,
-                                                                             "JNI_GetCreatedJavaVMs");
-    LOGI("JNI_GetCreatedJavaVMs %p", JNI_GetCreatedJavaVMs);
-    JavaVM *vms_buf[1];
-    JavaVM *vms;
-    jsize num_vms;
-    jint status = JNI_GetCreatedJavaVMs(vms_buf, 1, &num_vms);
-    if (status == JNI_OK && num_vms > 0) {
-        vms = vms_buf[0];
-    } else {
-        LOGE("GetCreatedJavaVMs error");
-        return false;
-    }
-
-    auto lib_dir = GetLibDir(vms);
-    if (lib_dir.empty()) {
-        LOGE("GetLibDir error");
-        return false;
-    }
-    if (lib_dir.find("/lib/x86") != std::string::npos) {
-        LOGI("no need NativeBridge");
-        munmap(data, length);
-        return false;
-    }
-
-    auto nb = dlopen("libhoudini.so", RTLD_NOW);
-    if (!nb) {
-        auto native_bridge = GetNativeBridgeLibrary();
-        LOGI("native bridge: %s", native_bridge.data());
-        nb = dlopen(native_bridge.data(), RTLD_NOW);
-    }
-    if (nb) {
-        LOGI("nb %p", nb);
-        auto callbacks = (NativeBridgeCallbacks *) dlsym(nb, "NativeBridgeItf");
-        if (callbacks) {
-            LOGI("NativeBridgeLoadLibrary %p", callbacks->loadLibrary);
-            LOGI("NativeBridgeLoadLibraryExt %p", callbacks->loadLibraryExt);
-            LOGI("NativeBridgeGetTrampoline %p", callbacks->getTrampoline);
-
-            int fd = syscall(__NR_memfd_create, "anon", MFD_CLOEXEC);
-            ftruncate(fd, (off_t) length);
-            void *mem = mmap(nullptr, length, PROT_WRITE, MAP_SHARED, fd, 0);
-            memcpy(mem, data, length);
-            munmap(mem, length);
-            munmap(data, length);
-            char path[PATH_MAX];
-            snprintf(path, PATH_MAX, "/proc/self/fd/%d", fd);
-            LOGI("arm path %s", path);
-
-            void *arm_handle;
-            if (api_level >= 26) {
-                arm_handle = callbacks->loadLibraryExt(path, RTLD_NOW, (void *) 3);
-            } else {
-                arm_handle = callbacks->loadLibrary(path, RTLD_NOW);
-            }
-            if (arm_handle) {
-                LOGI("arm handle %p", arm_handle);
-                auto init = (void (*)(JavaVM *, void *)) callbacks->getTrampoline(arm_handle,
-                                                                                  "JNI_OnLoad",
-                                                                                  nullptr, 0);
-                LOGI("JNI_OnLoad %p", init);
-                init(vms, (void *) game_data_dir);
-                return true;
-            }
-            close(fd);
-        }
-    }
-    return false;
-}
-
-void hack_prepare(const char *game_data_dir, void *data, size_t length) {
-    LOGI("hack thread: %d", gettid());
-    int api_level = android_get_device_api_level();
-    LOGI("api level: %d", api_level);
-
-#if defined(__i386__) || defined(__x86_64__)
-    if (!NativeBridgeLoad(game_data_dir, api_level, data, length)) {
-#endif
-        hack_start(game_data_dir);
-#if defined(__i386__) || defined(__x86_64__)
-    }
-#endif
-}
+// ... 后续代码完全保持你原本发送的版本即可 ...
 
 #if defined(__arm__) || defined(__aarch64__)
-
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
     auto game_data_dir = (const char *) reserved;
     std::thread hack_thread(hack_start, game_data_dir);
     hack_thread.detach();
     return JNI_VERSION_1_6;
 }
-
 #endif
