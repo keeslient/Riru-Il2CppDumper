@@ -15,7 +15,7 @@ android {
         externalNativeBuild {
             cmake {
                 arguments "-DMODULE_NAME:STRING=$moduleLibraryName"
-                abiFilters 'arm64-v8a' 
+                abiFilters 'arm64-v8a'
             }
         }
     }
@@ -57,20 +57,16 @@ afterEvaluate {
                 zygiskDir.mkdirs()
                 systemLibDir.mkdirs()
 
-                // 1. 移动并改名插件本体
+                // 1. 移动插件本体
                 def myLib = file("$magiskDir/lib/arm64-v8a/lib${moduleLibraryName}.so")
                 if(myLib.exists()){
                     Files.copy(myLib.toPath(), Paths.get(zygiskDir.absolutePath, "arm64-v8a.so"), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
                 }
 
-                // 2. 暴力拷贝所有依赖库到 system/lib64
-                def depDir = file("src/main/cpp/shadowhook/libs/arm64-v8a")
-                if(depDir.exists()){
-                    depDir.eachFile { f ->
-                        if(f.name.endsWith(".so")){
-                            Files.copy(f.toPath(), Paths.get(systemLibDir.absolutePath, f.name), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
-                        }
-                    }
+                // 2. 核心修复：将依赖库注入到系统目录，防止 Zygisk 加载失败导致卡死
+                def shSo = file("src/main/cpp/shadowhook/libs/arm64-v8a/libshadowhook.so")
+                if(shSo.exists()){
+                    Files.copy(shSo.toPath(), Paths.get(systemLibDir.absolutePath, "libshadowhook.so"), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
                 }
                 
                 file("$magiskDir/lib").deleteDir()
