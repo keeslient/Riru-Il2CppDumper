@@ -1,55 +1,39 @@
 cmake_minimum_required(VERSION 3.18.1)
 
-if (NOT DEFINED MODULE_NAME)
-    message(FATAL_ERROR "MODULE_NAME is not set")
-else ()
-    project(${MODULE_NAME})
-endif ()
+project("module")
 
-message("Build type: ${CMAKE_BUILD_TYPE}")
+# 设置模块名称，由 gradle 传入
+set(MODULE_NAME ${MODULE_NAME})
 
-set(CMAKE_CXX_STANDARD 20)
-
-# 加入了 ShadowHook 的头文件路径
-include_directories(
-        xdl/include
-        shadowhook/include
-)
-
-set(LINKER_FLAGS "-ffixed-x18 -Wl,--hash-style=both")
-set(C_FLAGS "-Werror=format -fdata-sections -ffunction-sections")
-set(CXX_FLAGS "${CXX_FLAGS} -fno-exceptions -fno-rtti")
-
-if (NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
-    set(C_FLAGS "${C_FLAGS} -O2 -fvisibility=hidden -fvisibility-inlines-hidden")
-    set(LINKER_FLAGS "${LINKER_FLAGS} -Wl,-exclude-libs,ALL -Wl,--gc-sections -Wl,--strip-all")
-else ()
-    set(C_FLAGS "${C_FLAGS} -O0")
-endif ()
-
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${C_FLAGS}")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${C_FLAGS} ${CXX_FLAGS}")
-
-set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${LINKER_FLAGS}")
-set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} ${LINKER_FLAGS}")
-
-# 导入 ShadowHook 预编译库
-add_library(shadowhook SHARED IMPORTED)
-set_target_properties(shadowhook PROPERTIES IMPORTED_LOCATION
-        ${CMAKE_SOURCE_DIR}/shadowhook/libs/${ANDROID_ABI}/libshadowhook.so)
-
-aux_source_directory(xdl xdl-src)
+# 1. 寻找 ShadowHook 路径 (假设在项目根目录或同级)
+# 这里指向你之前下载的 shadowhook 文件夹
+set(SHADOWHOOK_DIR ${CMAKE_SOURCE_DIR}/../../../../shadowhook)
 
 add_library(${MODULE_NAME} SHARED
-        main.cpp
-        hack.cpp
-        il2cpp_dump.cpp
-        ${xdl-src})
+    hack.cpp
+    # 如果有其他 cpp 文件请加在这里
+)
 
-# 链接 log, xdl(源码) 和 shadowhook
-target_link_libraries(${MODULE_NAME} shadowhook log)
+# 2. 包含头文件路径
+target_include_directories(${MODULE_NAME} PRIVATE
+    ${SHADOWHOOK_DIR}/include
+)
 
-if (NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
-    add_custom_command(TARGET ${MODULE_NAME} POST_BUILD
-            COMMAND ${CMAKE_STRIP} --strip-all --remove-section=.comment "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/lib${MODULE_NAME}.so")
-endif ()
+# 3. 引用静态库 (静态链接，不再产生 .so 依赖)
+add_library(shadowhook_static STATIC IMPORTED)
+set_target_properties(shadowhook_static PROPERTIES IMPORTED_LOCATION
+    ${SHADOWHOOK_DIR}/libs/${ANDROID_ABI}/libshadowhook.a)
+
+# 4. 链接所有库
+target_link_libraries(${MODULE_NAME}
+    shadowhook_static
+    log
+    android
+)
+
+# 强制隐藏所有符号以减小体积
+set_target_properties(${MODULE_NAME} PROPERTIES
+    C_VISIBILITY_PRESET hidden
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON
+)
