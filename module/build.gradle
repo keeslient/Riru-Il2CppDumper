@@ -57,16 +57,18 @@ afterEvaluate {
                 zygiskDir.mkdirs()
                 systemLibDir.mkdirs()
 
-                fileTree("$magiskDir/lib").visit { f ->
-                    if (f.directory) return
-                    if (f.name == "lib${moduleLibraryName}.so") {
-                        // 插件本体改名放入 zygisk
-                        Files.copy(f.file.toPath(), Paths.get(zygiskDir.absolutePath, "arm64-v8a.so"), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
-                    } else if (f.name == "libshadowhook.so") {
-                        // 依赖库注入系统目录，解决找不到依赖导致的卡死
-                        Files.copy(f.file.toPath(), Paths.get(systemLibDir.absolutePath, "libshadowhook.so"), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
-                    }
+                // 1. 移动并改名插件本体
+                def myLib = file("$magiskDir/lib/arm64-v8a/lib${moduleLibraryName}.so")
+                if(myLib.exists()){
+                    Files.copy(myLib.toPath(), Paths.get(zygiskDir.absolutePath, "arm64-v8a.so"), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
                 }
+
+                // 2. 直接从源码目录拷贝 libshadowhook.so 到 system/lib64 (最稳妥的做法)
+                def shSource = file("src/main/cpp/shadowhook/libs/arm64-v8a/libshadowhook.so")
+                if(shSource.exists()){
+                    Files.copy(shSource.toPath(), Paths.get(systemLibDir.absolutePath, "libshadowhook.so"), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+                }
+                
                 file("$magiskDir/lib").deleteDir()
             }
         }
